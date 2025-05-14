@@ -1,0 +1,12 @@
+{
+  "name": "alpha-system-pbmanager-cli",
+  "version": "0.1.6",
+  "main": "pb-manager.js",
+  "scripts": {
+    "start": "node pb-manager.js",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "prettier": "^3.5.3"
+  }
+}

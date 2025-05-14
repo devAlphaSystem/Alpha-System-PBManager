@@ -14,7 +14,7 @@ const prettyBytes = require("pretty-bytes");
 const blessed = require("blessed");
 const contrib = require("blessed-contrib");
 
-const CONFIG_DIR = path.join(process.env.HOME, ".pb-manager");
+const CONFIG_DIR = path.join(process.env.HOME || os.homedir(), ".pb-manager");
 const CLI_CONFIG_PATH = path.join(CONFIG_DIR, "cli-config.json");
 const INSTANCES_CONFIG_PATH = path.join(CONFIG_DIR, "instances.json");
 const POCKETBASE_BIN_DIR = path.join(CONFIG_DIR, "bin");
@@ -27,33 +27,53 @@ const NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 
 let completeLogging = false;
 
-async function getLatestPocketBaseVersion() {
+let _latestPocketBaseVersionCache = null;
+const FALLBACK_POCKETBASE_VERSION = "0.28.1";
+
+async function getLatestPocketBaseVersion(forceRefresh = false) {
+  if (_latestPocketBaseVersionCache && !forceRefresh) {
+    return _latestPocketBaseVersionCache;
+  }
   try {
     const res = await axios.get("https://api.github.com/repos/pocketbase/pocketbase/releases/latest", { headers: { "User-Agent": "pb-manager" } });
     if (res.data?.tag_name) {
-      return res.data.tag_name.replace(/^v/, "");
+      _latestPocketBaseVersionCache = res.data.tag_name.replace(/^v/, "");
+      return _latestPocketBaseVersionCache;
+    }
+    if (completeLogging) {
+      console.warn(chalk.yellow(`Could not determine latest PocketBase version from GitHub API response. Using fallback ${FALLBACK_POCKETBASE_VERSION}.`));
     }
   } catch (e) {
     if (completeLogging) {
-      console.error(chalk.red("Failed to fetch latest PocketBase version from GitHub. Using fallback version 0.28.1."));
+      console.error(chalk.red(`Failed to fetch latest PocketBase version from GitHub: ${e.message}. Using fallback version ${FALLBACK_POCKETBASE_VERSION}.`));
     }
   }
-  return "0.28.1";
+  _latestPocketBaseVersionCache = FALLBACK_POCKETBASE_VERSION;
+  return _latestPocketBaseVersionCache;
 }
 
 async function getCliConfig() {
-  const latestVersion = await getLatestPocketBaseVersion();
+  const latestVersion = (await getLatestPocketBaseVersion()) || FALLBACK_POCKETBASE_VERSION;
+  const defaults = {
+    defaultCertbotEmail: null,
+    defaultPocketBaseVersion: latestVersion,
+    completeLogging: false,
+  };
+
   if (await fs.pathExists(CLI_CONFIG_PATH)) {
     try {
       const config = await fs.readJson(CLI_CONFIG_PATH);
-      return Object.assign({ defaultCertbotEmail: null, defaultPocketBaseVersion: latestVersion, completeLogging: false }, config);
+      if (!config.defaultPocketBaseVersion || typeof config.defaultPocketBaseVersion !== "string" || !/^\d+\.\d+\.\d+$/.test(config.defaultPocketBaseVersion)) {
+        config.defaultPocketBaseVersion = latestVersion;
+      }
+      return { ...defaults, ...config };
     } catch (e) {
       if (completeLogging) {
         console.warn(chalk.yellow("Could not read CLI config, using defaults."));
       }
     }
   }
-  return { defaultCertbotEmail: null, defaultPocketBaseVersion: latestVersion, completeLogging: false };
+  return defaults;
 }
 
 async function saveCliConfig(config) {
@@ -85,7 +105,7 @@ async function saveInstancesConfig(config) {
 
 async function downloadPocketBaseIfNotExists(versionOverride = null) {
   const cliConfig = await getCliConfig();
-  const versionToDownload = versionOverride || cliConfig.defaultPocketBaseVersion || (await getLatestPocketBaseVersion());
+  const versionToDownload = versionOverride || cliConfig.defaultPocketBaseVersion;
 
   if (!versionOverride && (await fs.pathExists(POCKETBASE_EXEC_PATH))) {
     if (completeLogging) {
@@ -106,7 +126,11 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
     console.log(chalk.blue(`Downloading PocketBase v${versionToDownload} from ${downloadUrl}...`));
   }
   try {
-    const response = await axios({ url: downloadUrl, method: "GET", responseType: "stream" });
+    const response = await axios({
+      url: downloadUrl,
+      method: "GET",
+      responseType: "stream",
+    });
     const zipPath = path.join(POCKETBASE_BIN_DIR, "pocketbase.zip");
     const writer = fs.createWriteStream(zipPath);
     response.data.pipe(writer);
@@ -339,15 +363,22 @@ async function getInstanceUsageAnalytics(instances) {
   const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
   let pm2List = [];
   if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
-    pm2List = JSON.parse(pm2ListRaw.stdout);
+    try {
+      pm2List = JSON.parse(pm2ListRaw.stdout);
+    } catch (e) {
+      if (completeLogging) {
+        console.error(chalk.red("Failed to parse pm2 jlist output."));
+      }
+      pm2List = [];
+    }
   }
   const usage = [];
   for (const name in instances) {
     const inst = instances[name];
     let pm2Proc;
-    for (const i in pm2List) {
-      if (pm2List[i].name === `pb-${name}`) {
-        pm2Proc = pm2List[i];
+    for (const proc of pm2List) {
+      if (proc.name === `pb-${name}`) {
+        pm2Proc = proc;
         break;
       }
     }
@@ -358,7 +389,9 @@ async function getInstanceUsageAnalytics(instances) {
     const dataDir = inst.dataDir;
     let dataSize = 0;
     try {
-      dataSize = await getDirectorySize(dataDir);
+      if (await fs.pathExists(dataDir)) {
+        dataSize = await getDirectorySize(dataDir);
+      }
     } catch (e) {}
     let httpStatus = "-";
     try {
@@ -419,10 +452,29 @@ async function showDashboard() {
     console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
     return;
   }
-  const screen = blessed.screen({ smartCSR: true, title: "PocketBase Manager Dashboard" });
+  const screen = blessed.screen({
+    smartCSR: true,
+    title: "PocketBase Manager Dashboard",
+  });
   const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
-  const table = grid.set(0, 0, 10, 12, contrib.table, { keys: true, fg: "white", selectedFg: "white", selectedBg: "blue", interactive: true, label: "PocketBase Instances", width: "100%", height: "100%", border: { type: "line", fg: "cyan" }, columnSpacing: 2, columnWidth: [12, 24, 7, 10, 8, 10, 10, 8, 8, 8] });
-  const help = grid.set(10, 0, 2, 12, blessed.box, { content: " [q] Quit  [r] Refresh  [l] Logs  [s] Start/Stop  [d] Delete", tags: true, style: { fg: "yellow" } });
+  const table = grid.set(0, 0, 10, 12, contrib.table, {
+    keys: true,
+    fg: "white",
+    selectedFg: "white",
+    selectedBg: "blue",
+    interactive: true,
+    label: "PocketBase Instances",
+    width: "100%",
+    height: "100%",
+    border: { type: "line", fg: "cyan" },
+    columnSpacing: 2,
+    columnWidth: [12, 24, 7, 10, 8, 10, 10, 8, 8, 8],
+  });
+  const help = grid.set(10, 0, 2, 12, blessed.box, {
+    content: " [q] Quit  [r] Refresh  [l] Logs  [s] Start/Stop  [d] Delete",
+    tags: true,
+    style: { fg: "yellow" },
+  });
 
   let currentData = [];
   let selectedIndex = 0;
@@ -434,9 +486,13 @@ async function showDashboard() {
     for (const u of usage) {
       data.push([u.name, u.domain, u.port, u.status, u.httpStatus, u.ssl, `${u.cpu}%`, prettyBytes(u.mem), formatUptime(u.uptime), prettyBytes(u.dataSize)]);
     }
-    table.setData({ headers: ["Name", "Domain", "Port", "Status", "HTTP", "SSL", "CPU", "Mem", "Uptime", "Data"], data });
+    table.setData({
+      headers: ["Name", "Domain", "Port", "Status", "HTTP", "SSL", "CPU", "Mem", "Uptime", "Data"],
+      data,
+    });
     if (data.length > 0) {
       if (selectedIndex >= data.length) selectedIndex = data.length - 1;
+      if (selectedIndex < 0) selectedIndex = 0; // Ensure not negative
       table.rows.select(selectedIndex);
     }
     screen.render();
@@ -471,7 +527,8 @@ async function showDashboard() {
     if (idx >= 0 && idx < currentData.length) {
       const name = currentData[idx].name;
       screen.destroy();
-      shell.exec(`pm2 logs pb-${name} --lines 50`, { async: false });
+      clearInterval(interval);
+      shell.exec(`pm2 logs pb-${name} --lines 50`);
       process.exit(0);
     }
   });
@@ -493,7 +550,8 @@ async function showDashboard() {
     if (idx >= 0 && idx < currentData.length) {
       const name = currentData[idx].name;
       screen.destroy();
-      shell.exec(`pb-manager remove ${name}`, { async: false });
+      clearInterval(interval);
+      shell.exec(`pb-manager remove ${name}`);
       process.exit(0);
     }
   });
@@ -517,27 +575,71 @@ program
   .action(async () => {
     await ensureBaseSetup();
     const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
 
-    const { action } = await inquirer.prompt([{ type: "list", name: "action", message: "CLI Configuration:", choices: [{ name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`, value: "setEmail" }, { name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`, value: "setPbVersion" }, { name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`, value: "setLogging" }, new inquirer.Separator(), { name: "View current JSON config", value: "viewConfig" }, { name: "Exit", value: "exit" }] }]);
+    const { action } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "action",
+        message: "CLI Configuration:",
+        choices: [
+          {
+            name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`,
+            value: "setEmail",
+          },
+          {
+            name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`,
+            value: "setPbVersion",
+          },
+          {
+            name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`,
+            value: "setLogging",
+          },
+          new inquirer.Separator(),
+          { name: "View current JSON config", value: "viewConfig" },
+          { name: "Exit", value: "exit" },
+        ],
+      },
+    ]);
 
     switch (action) {
       case "setEmail": {
-        const { email } = await inquirer.prompt([{ type: "input", name: "email", message: "Enter new default Certbot email (leave blank to clear):", default: cliConfig.defaultCertbotEmail }]);
+        const { email } = await inquirer.prompt([
+          {
+            type: "input",
+            name: "email",
+            message: "Enter new default Certbot email (leave blank to clear):",
+            default: cliConfig.defaultCertbotEmail,
+          },
+        ]);
         cliConfig.defaultCertbotEmail = email || null;
         await saveCliConfig(cliConfig);
         console.log(chalk.green("Default Certbot email updated."));
         break;
       }
       case "setPbVersion": {
-        const { version } = await inquirer.prompt([{ type: "input", name: "version", message: "Enter new default PocketBase version (e.g., 0.22.10):", default: cliConfig.defaultPocketBaseVersion, validate: (input) => (/^(\d+\.\d+\.\d+)$/.test(input) || input === "" ? true : "Please enter a valid version (x.y.z) or leave blank.") }]);
+        const { version } = await inquirer.prompt([
+          {
+            type: "input",
+            name: "version",
+            message: "Enter new default PocketBase version (e.g., 0.22.10):",
+            default: cliConfig.defaultPocketBaseVersion,
+            validate: (input) => (/^(\d+\.\d+\.\d+)$/.test(input) || input === "" ? true : "Please enter a valid version (x.y.z) or leave blank."),
+          },
+        ]);
         cliConfig.defaultPocketBaseVersion = version || (await getLatestPocketBaseVersion());
         await saveCliConfig(cliConfig);
         console.log(chalk.green("Default PocketBase version updated."));
         break;
       }
       case "setLogging": {
-        const { enableLogging } = await inquirer.prompt([{ type: "confirm", name: "enableLogging", message: "Enable complete logging (show all commands and outputs)?", default: cliConfig.completeLogging || false }]);
+        const { enableLogging } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "enableLogging",
+            message: "Enable complete logging (show all commands and outputs)?",
+            default: cliConfig.completeLogging || false,
+          },
+        ]);
         cliConfig.completeLogging = enableLogging;
         await saveCliConfig(cliConfig);
         completeLogging = enableLogging;
@@ -563,8 +665,6 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
-    const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
     console.log(chalk.bold.cyan("Starting PocketBase Manager Setup..."));
     await ensureBaseSetup();
     await downloadPocketBaseIfNotExists(options.version);
@@ -580,7 +680,6 @@ program
       process.exit(1);
     }
     const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
     await ensureBaseSetup();
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       if (completeLogging) {
@@ -594,11 +693,37 @@ program
     }
 
     const initialAnswers = await inquirer.prompt([
-      { type: "input", name: "name", message: "Instance name (e.g., my-app, no spaces):", validate: (input) => (/^[a-zA-Z0-9-]+$/.test(input) ? true : "Invalid name format.") },
-      { type: "input", name: "domain", message: "Domain/subdomain for this instance (e.g., app.example.com):", validate: (input) => (input.length > 0 ? true : "Domain cannot be empty.") },
-      { type: "number", name: "port", message: "Internal port for this instance (e.g., 8091):", default: 8090 + Math.floor(Math.random() * 100), validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port.") },
-      { type: "confirm", name: "useHttp2", message: "Enable HTTP/2 in Nginx config?", default: true },
-      { type: "confirm", name: "maxBody20Mb", message: "Set 20Mb max body size (client_max_body_size 20M) in Nginx config?", default: true },
+      {
+        type: "input",
+        name: "name",
+        message: "Instance name (e.g., my-app, no spaces):",
+        validate: (input) => (/^[a-zA-Z0-9-]+$/.test(input) ? true : "Invalid name format."),
+      },
+      {
+        type: "input",
+        name: "domain",
+        message: "Domain/subdomain for this instance (e.g., app.example.com):",
+        validate: (input) => (input.length > 0 ? true : "Domain cannot be empty."),
+      },
+      {
+        type: "number",
+        name: "port",
+        message: "Internal port for this instance (e.g., 8091):",
+        default: 8090 + Math.floor(Math.random() * 100),
+        validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port."),
+      },
+      {
+        type: "confirm",
+        name: "useHttp2",
+        message: "Enable HTTP/2 in Nginx config?",
+        default: true,
+      },
+      {
+        type: "confirm",
+        name: "maxBody20Mb",
+        message: "Set 20Mb max body size (client_max_body_size 20M) in Nginx config?",
+        default: true,
+      },
     ]);
 
     const config = await getInstancesConfig();
@@ -616,10 +741,34 @@ program
     let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
 
     const httpsAnswers = await inquirer.prompt([
-      { type: "confirm", name: "useHttps", message: "Configure HTTPS (Certbot)?", default: true },
-      { type: "confirm", name: "useDefaultEmail", message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`, default: true, when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail },
-      { type: "input", name: "emailForCertbot", message: "Enter email for Let's Encrypt:", when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail), validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."), default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConfig.defaultCertbotEmail) },
-      { type: "confirm", name: "autoRunCertbot", message: "Attempt to automatically run Certbot now to obtain the SSL certificate?", default: true, when: (answers) => answers.useHttps },
+      {
+        type: "confirm",
+        name: "useHttps",
+        message: "Configure HTTPS (Certbot)?",
+        default: true,
+      },
+      {
+        type: "confirm",
+        name: "useDefaultEmail",
+        message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`,
+        default: true,
+        when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail,
+      },
+      {
+        type: "input",
+        name: "emailForCertbot",
+        message: "Enter email for Let's Encrypt:",
+        when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail),
+        validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."),
+        default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConfig.defaultCertbotEmail),
+      },
+      {
+        type: "confirm",
+        name: "autoRunCertbot",
+        message: "Attempt to automatically run Certbot now to obtain the SSL certificate?",
+        default: true,
+        when: (answers) => answers.useHttps,
+      },
     ]);
 
     if (httpsAnswers.useHttps) {
@@ -684,12 +833,30 @@ program
 
     let adminCreatedViaCli = false;
 
-    const { createAdminCli } = await inquirer.prompt([{ type: "confirm", name: "createAdminCli", message: "Do you want to create a superuser (admin) account for this instance via CLI now?", default: true }]);
+    const { createAdminCli } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "createAdminCli",
+        message: "Do you want to create a superuser (admin) account for this instance via CLI now?",
+        default: true,
+      },
+    ]);
 
     if (createAdminCli) {
       const adminCredentials = await inquirer.prompt([
-        { type: "input", name: "adminEmail", message: "Enter admin email:", validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email.") },
-        { type: "password", name: "adminPassword", message: "Enter admin password (min 8 chars):", mask: "*", validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters.") },
+        {
+          type: "input",
+          name: "adminEmail",
+          message: "Enter admin email:",
+          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+        },
+        {
+          type: "password",
+          name: "adminPassword",
+          message: "Enter admin password (min 8 chars):",
+          mask: "*",
+          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+        },
       ]);
 
       const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${instanceDataDir}"`;
@@ -746,8 +913,6 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
-    const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
     console.log(chalk.bold.cyan("Attempting to update PocketBase executable..."));
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       console.error(chalk.red("PocketBase executable not found. Run 'setup' or 'configure' to set a version and download."));
@@ -757,7 +922,10 @@ program
       if (completeLogging) {
         console.log(chalk.yellow(`Running: ${POCKETBASE_EXEC_PATH} update`));
       }
-      const updateResult = shell.exec(`${POCKETBASE_EXEC_PATH} update`, { cwd: POCKETBASE_BIN_DIR, silent: !completeLogging });
+      const updateResult = shell.exec(`${POCKETBASE_EXEC_PATH} update`, {
+        cwd: POCKETBASE_BIN_DIR,
+        silent: !completeLogging,
+      });
 
       if (updateResult.code !== 0) {
         console.error(chalk.red("PocketBase update command failed."));
@@ -802,15 +970,20 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
-    const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
     const config = await getInstancesConfig();
     if (!config.instances[name]) {
       console.error(chalk.red(`Instance "${name}" not found.`));
       return;
     }
 
-    const { confirm } = await inquirer.prompt([{ type: "confirm", name: "confirm", message: `Are you sure you want to remove instance "${name}"? This will stop it, remove its PM2 entry, and Nginx config. Data directory will NOT be deleted automatically.`, default: false }]);
+    const { confirm } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirm",
+        message: `Are you sure you want to remove instance "${name}"? This will stop it, remove its PM2 entry, and Nginx config. Data directory will NOT be deleted automatically.`,
+        default: false,
+      },
+    ]);
 
     if (!confirm) {
       console.log(chalk.yellow("Removal cancelled."));
@@ -873,8 +1046,6 @@ program
   .command("list")
   .description("List all managed PocketBase instances")
   .action(async () => {
-    const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
     const config = await getInstancesConfig();
     if (Object.keys(config.instances).length === 0) {
       console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
@@ -923,8 +1094,6 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
-    const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
     try {
       runCommand(`pm2 start pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} started.`));
@@ -941,8 +1110,6 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
-    const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
     try {
       runCommand(`pm2 stop pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} stopped.`));
@@ -959,8 +1126,6 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
-    const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
     try {
       runCommand(`pm2 restart pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} restarted.`));
@@ -977,10 +1142,8 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
-    const cliConfig = shell.test("-f", CLI_CONFIG_PATH) ? require(CLI_CONFIG_PATH) : {};
-    completeLogging = cliConfig.completeLogging || false;
     console.log(chalk.blue(`Displaying logs for pb-${name}. Press Ctrl+C to exit.`));
-    shell.exec(`pm2 logs pb-${name} --lines 50`, { async: false });
+    shell.exec(`pm2 logs pb-${name} --lines 50`);
   });
 
 async function main() {
@@ -990,6 +1153,7 @@ async function main() {
   }
   const cliConfig = await getCliConfig();
   completeLogging = cliConfig.completeLogging || false;
+
   if (!shell.which("pm2")) {
     console.error(chalk.red("PM2 is not installed or not in PATH. Please install PM2: npm install -g pm2"));
     process.exit(1);
@@ -1004,7 +1168,7 @@ async function main() {
 
 main().catch((err) => {
   console.error(chalk.red("An unexpected error occurred:"), err.message);
-  if (err.stack && process.env.DEBUG) {
+  if (err.stack && (completeLogging || process.env.DEBUG)) {
     console.error(err.stack);
   }
   process.exit(1);
