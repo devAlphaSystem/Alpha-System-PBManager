@@ -8,6 +8,11 @@ const axios = require("axios");
 const chalk = require("chalk");
 const unzipper = require("unzipper");
 const shell = require("shelljs");
+const os = require("node:os");
+const Table = require("cli-table3");
+const prettyBytes = require("pretty-bytes");
+const blessed = require("blessed");
+const contrib = require("blessed-contrib");
 
 const CONFIG_DIR = path.join(process.env.HOME, ".pb-manager");
 const CLI_CONFIG_PATH = path.join(CONFIG_DIR, "cli-config.json");
@@ -312,6 +317,195 @@ async function runCertbot(domain, email) {
     return false;
   }
 }
+
+async function getInstanceUsageAnalytics(instances) {
+  const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
+  let pm2List = [];
+  if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
+    pm2List = JSON.parse(pm2ListRaw.stdout);
+  }
+  const usage = [];
+  for (const name in instances) {
+    const inst = instances[name];
+    const pm2Proc = pm2List.find((proc) => proc.name === `pb-${name}`);
+    const status = pm2Proc ? pm2Proc.pm2_env.status : "offline";
+    const cpu = pm2Proc?.monit ? pm2Proc.monit.cpu : 0;
+    const mem = pm2Proc?.monit ? pm2Proc.monit.memory : 0;
+    const uptime = pm2Proc?.pm2_env.pm_uptime ? Date.now() - pm2Proc.pm2_env.pm_uptime : 0;
+    const dataDir = inst.dataDir;
+    let dataSize = 0;
+    try {
+      dataSize = await getDirectorySize(dataDir);
+    } catch (e) {}
+    let httpStatus = "-";
+    try {
+      const url = `http://127.0.0.1:${inst.port}/api/health`;
+      const res = await axios.get(url, { timeout: 1000 }).catch(() => null);
+      httpStatus = res && res.status === 200 ? "OK" : "ERR";
+    } catch (e) {
+      httpStatus = "ERR";
+    }
+    usage.push({
+      name,
+      domain: inst.domain,
+      port: inst.port,
+      status,
+      cpu,
+      mem,
+      uptime,
+      dataSize,
+      httpStatus,
+      ssl: inst.useHttps ? "Yes" : "No",
+    });
+  }
+  return usage;
+}
+
+async function getDirectorySize(dir) {
+  let total = 0;
+  const files = await fs.readdir(dir);
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const stat = await fs.stat(filePath);
+    if (stat.isDirectory()) {
+      total += await getDirectorySize(filePath);
+    } else {
+      total += stat.size;
+    }
+  }
+  return total;
+}
+
+function formatUptime(ms) {
+  if (!ms || ms < 0) return "-";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${m % 60}m`;
+  const d = Math.floor(h / 24);
+  return `${d}d ${h % 24}h`;
+}
+
+async function showDashboard() {
+  await ensureBaseSetup();
+  const config = await getInstancesConfig();
+  const instanceNames = Object.keys(config.instances);
+  if (instanceNames.length === 0) {
+    console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
+    return;
+  }
+  const screen = blessed.screen({ smartCSR: true, title: "PocketBase Manager Dashboard" });
+  const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
+  const table = grid.set(0, 0, 10, 12, contrib.table, {
+    keys: true,
+    fg: "white",
+    selectedFg: "white",
+    selectedBg: "blue",
+    interactive: true,
+    label: "PocketBase Instances",
+    width: "100%",
+    height: "100%",
+    border: { type: "line", fg: "cyan" },
+    columnSpacing: 2,
+    columnWidth: [12, 24, 7, 10, 8, 10, 10, 8, 8, 8],
+  });
+  const help = grid.set(10, 0, 2, 12, blessed.box, {
+    content: " [q] Quit  [r] Refresh  [l] Logs  [s] Start/Stop  [d] Delete",
+    tags: true,
+    style: { fg: "yellow" },
+  });
+
+  let currentData = [];
+  let selectedIndex = 0;
+
+  async function refreshTable() {
+    const usage = await getInstanceUsageAnalytics(config.instances);
+    currentData = usage;
+    const data = [];
+    for (const u of usage) {
+      data.push([u.name, u.domain, u.port, u.status, u.httpStatus, u.ssl, `${u.cpu}%`, prettyBytes(u.mem), formatUptime(u.uptime), prettyBytes(u.dataSize)]);
+    }
+    table.setData({
+      headers: ["Name", "Domain", "Port", "Status", "HTTP", "SSL", "CPU", "Mem", "Uptime", "Data"],
+      data,
+    });
+    if (data.length > 0) {
+      if (selectedIndex >= data.length) selectedIndex = data.length - 1;
+      table.rows.select(selectedIndex);
+    }
+    screen.render();
+  }
+
+  await refreshTable();
+  const interval = setInterval(refreshTable, 2000);
+  table.focus();
+
+  table.rows.on("select", (_, idx) => {
+    selectedIndex = typeof idx === "number" ? idx : table.rows.selected;
+  });
+
+  table.rows.on("keypress", (_, key) => {
+    if (key && key.name === "up") {
+      selectedIndex = Math.max(0, table.rows.selected);
+    }
+    if (key && key.name === "down") {
+      selectedIndex = Math.min(currentData.length - 1, table.rows.selected);
+    }
+  });
+
+  screen.key(["q", "C-c"], () => {
+    clearInterval(interval);
+    return process.exit(0);
+  });
+  screen.key(["r"], async () => {
+    await refreshTable();
+  });
+  screen.key(["l"], () => {
+    const idx = table.rows.selected;
+    if (idx >= 0 && idx < currentData.length) {
+      const name = currentData[idx].name;
+      screen.destroy();
+      shell.exec(`pm2 logs pb-${name} --lines 50`, { async: false });
+      process.exit(0);
+    }
+  });
+  screen.key(["s"], async () => {
+    const idx = table.rows.selected;
+    if (idx >= 0 && idx < currentData.length) {
+      const name = currentData[idx].name;
+      const inst = currentData[idx];
+      if (inst.status === "online") {
+        runCommand(`pm2 stop pb-${name}`);
+      } else {
+        runCommand(`pm2 start pb-${name}`);
+      }
+      await refreshTable();
+    }
+  });
+  screen.key(["d"], async () => {
+    const idx = table.rows.selected;
+    if (idx >= 0 && idx < currentData.length) {
+      const name = currentData[idx].name;
+      screen.destroy();
+      shell.exec(`pb-manager remove ${name}`, { async: false });
+      process.exit(0);
+    }
+  });
+  screen.render();
+}
+
+program
+  .command("dashboard")
+  .description("Show interactive dashboard for all PocketBase instances")
+  .action(async () => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
+    await showDashboard();
+  });
 
 program
   .command("configure")

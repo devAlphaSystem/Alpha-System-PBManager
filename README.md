@@ -2,7 +2,7 @@
 
 ## Introduction
 
-`pb-manager` is a command-line interface (CLI) tool designed to simplify the management of multiple PocketBase instances on a single Linux server. It automates setup, configuration, and ongoing maintenance tasks, including process management with PM2, reverse proxying with Nginx, SSL certificate handling with Certbot, and secure Nginx configuration.
+`pb-manager` is a command-line interface (CLI) tool designed to simplify the management of multiple PocketBase instances on a single Linux server. It automates setup, configuration, and ongoing maintenance tasks, including process management with PM2, reverse proxying with Nginx, SSL certificate handling with Certbot, secure Nginx configuration, and provides an interactive dashboard for instance monitoring.
 
 ### Why pb-manager?
 
@@ -14,6 +14,7 @@ Running multiple web applications, like PocketBase instances, on one server can 
 - Process management to ensure it stays running.
 - Optionally, HTTPS for secure connections.
 - Secure and modern Nginx configuration.
+- Easy monitoring and management.
 
 `pb-manager` streamlines these processes by providing a single tool to:
 
@@ -25,6 +26,7 @@ Running multiple web applications, like PocketBase instances, on one server can 
 - Update the core PocketBase executable and restart instances.
 - Guide or automate the creation of the initial superuser (admin) account for each instance.
 - Enforce that all commands are run as root or with `sudo` for maximum reliability.
+- Offer an **interactive dashboard** to view instance status, resource usage, and perform quick actions.
 - Allow you to enable or disable **complete logging** for more or less verbose output.
 
 ---
@@ -41,6 +43,7 @@ Running multiple web applications, like PocketBase instances, on one server can 
 6. **Nginx:** When an instance is added, `pb-manager` generates a secure Nginx server block configuration file in `/etc/nginx/sites-available/` and creates a symbolic link in `/etc/nginx/sites-enabled/`. This configures Nginx to act as a reverse proxy, forwarding requests from a public domain to the instance's internal port, with optional HTTP/2 and upload size limit.
 7. **Certbot:** If HTTPS is enabled for an instance, `pb-manager` can attempt to run Certbot to obtain and install a Let's Encrypt SSL certificate for the specified domain. Certbot will modify the Nginx configuration to enable HTTPS.
 8. **Superuser Creation:** When adding a new instance, `pb-manager` offers to create the initial PocketBase superuser (admin) account via the CLI, or guides you to do it via the web UI.
+9. **Interactive Dashboard:** Uses `blessed` and `blessed-contrib` to render a terminal-based UI for real-time monitoring and management of instances.
 
 ---
 
@@ -90,7 +93,7 @@ curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManag
 3. **Initialize npm and install dependencies:**
    ```bash
    npm init -y
-   npm install commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs
+   npm install commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs blessed blessed-contrib cli-table3 pretty-bytes@5.6.0
    ```
 4. **Make the script executable:**
    ```bash
@@ -118,6 +121,28 @@ curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManag
 ## Commands
 
 All commands **must be run as root or with `sudo`**. Many commands that interact with system services like Nginx or PM2 require `sudo`.
+
+---
+
+### `dashboard`
+
+**Purpose:** Shows an interactive terminal-based dashboard for all managed PocketBase instances.
+
+**Usage:**  
+`sudo pb-manager dashboard`
+
+**Features:**
+
+- Real-time view of instance status (Online/Offline), HTTP health, SSL status.
+- CPU and Memory usage per instance (from PM2).
+- Instance uptime.
+- Data directory size.
+- **Hotkeys for actions:**
+  - `q` or `Ctrl+C`: Quit dashboard.
+  - `r`: Refresh data immediately.
+  - `l`: View logs for the selected instance.
+  - `s`: Start/Stop the selected instance.
+  - `d`: Delete the selected instance (will exit dashboard and run the remove command).
 
 ---
 
@@ -319,6 +344,29 @@ You can enable or disable **complete logging** via the `configure` command.
 
 - When enabled, all commands and outputs (including shell commands, Nginx reloads, PM2 actions, etc.) are shown.
 - When disabled (default), only concise and essential output is shown.
+
+---
+
+## Potential Issues & Disclaimer
+
+While `pb-manager` aims to automate and simplify server management tasks, it interacts with critical system components. Users should be aware of potential issues:
+
+- **Dependency Conflicts:** Issues with Node.js, npm, PM2, Nginx, or Certbot versions or their configurations on the host system can affect `pb-manager`. The installer attempts to set up a consistent environment, but pre-existing or conflicting setups might cause problems.
+- **Nginx Configuration Errors:** If Nginx fails to reload due to syntax errors (either from `pb-manager` generated configs or other existing configs), your web services might become unavailable. Always check `sudo nginx -t` if issues arise.
+- **Certbot Failures:** SSL certificate acquisition can fail due to various reasons:
+  - Incorrect DNS propagation (domain not pointing to the server).
+  - Firewall blocking ports 80/443.
+  - Let's Encrypt rate limits.
+  - Issues with the Nginx plugin or existing Nginx configuration.
+- **PM2 Issues:** Problems with PM2 itself or the way it manages the PocketBase processes could lead to instances not starting or restarting correctly. Check PM2 logs (`pm2 logs <process-name>`).
+- **File System Permissions:** Incorrect permissions for the `~/.pb-manager` directory, Nginx configuration directories, or PocketBase data directories can cause operations to fail. The script assumes it's run with `sudo` which generally handles this, but manual changes or unusual system setups might interfere.
+- **PocketBase Updates:** While `pb-manager` facilitates updating the PocketBase binary, breaking changes in new PocketBase versions could potentially affect existing instances if they are not compatible. Always review PocketBase release notes before updating.
+- **Data Loss:** The `remove` command **does not delete instance data by default**. However, any script that manages files and directories carries an inherent risk if misused or if bugs exist. **Always back up your data regularly and independently of this tool.**
+- **Script Bugs:** As with any software, `pb-manager` itself might contain bugs that could lead to unexpected behavior. Use with caution, especially in production environments. Test thoroughly in a staging environment first.
+- **Network Issues:** Downloading PocketBase or interacting with GitHub/Let's Encrypt APIs requires a stable internet connection.
+- **Resource Exhaustion:** Running too many PocketBase instances on an under-powered server can lead to performance issues or crashes. Monitor your server resources.
+
+**Disclaimer:** This tool is provided as-is, without any warranty. The user assumes all responsibility for its use and any potential impact on their system. **Always back up critical data before performing significant system changes or running management scripts.**
 
 ---
 

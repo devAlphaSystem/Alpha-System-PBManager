@@ -98,7 +98,7 @@ cd "${PB_MANAGER_INSTALL_DIR}" || error "Failed to change directory to ${PB_MANA
 if [ ! -f "package.json" ]; then
   npm init -y || warn "npm init -y failed, proceeding with dependency installation."
 fi
-npm install commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs || error "Failed to install pb-manager dependencies."
+npm install commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs blessed blessed-contrib cli-table3 pretty-bytes@5.6.0 || error "Failed to install pb-manager dependencies."
 success "pb-manager dependencies installed."
 cd "${ORIGINAL_DIR}"
 
@@ -120,11 +120,10 @@ success "-------------------------------------------------------"
 success "pb-manager pre-configuration complete!"
 success "-------------------------------------------------------"
 info "Next steps:"
-info "1. If this is the first time, run: pb-manager configure"
-info "   (This can be run as a normal user, not necessarily root)"
-info "2. Then, to download the PocketBase binary: pb-manager setup"
-info "   (This also can be run as a normal user)"
-info "3. To add a new PocketBase instance (this may require sudo for Nginx/Certbot): sudo pb-manager add"
+info "1. If this is the first time, run: sudo pb-manager configure"
+info "2. Then, to download the PocketBase binary: sudo pb-manager setup"
+info "3. To add a new PocketBase instance: sudo pb-manager add"
+info "4. To view the dashboard: sudo pb-manager dashboard"
 info "Refer to the pb-manager documentation for more commands and usage."
 
 exit 0
