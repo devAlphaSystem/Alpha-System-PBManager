@@ -25,6 +25,7 @@ Running multiple web applications, like PocketBase instances, on one server can 
 - Update the core PocketBase executable and restart instances.
 - Guide or automate the creation of the initial superuser (admin) account for each instance.
 - Enforce that all commands are run as root or with `sudo` for maximum reliability.
+- Allow you to enable or disable **complete logging** for more or less verbose output.
 
 ---
 
@@ -34,7 +35,7 @@ Running multiple web applications, like PocketBase instances, on one server can 
 
 1. **PocketBase Executable:** Downloads a single PocketBase executable (latest version by default) and stores it in a central location (`~/.pb-manager/bin/`). All managed instances use this single binary.
 2. **Instance Configuration:** Details about each managed PocketBase instance (name, domain, port, data directory, HTTPS settings, HTTP/2, max body size) are stored in a JSON file (`~/.pb-manager/instances.json`).
-3. **CLI Configuration:** Global settings for `pb-manager` itself, like default Certbot email and default PocketBase version for setup, are stored in `~/.pb-manager/cli-config.json`.
+3. **CLI Configuration:** Global settings for `pb-manager` itself, like default Certbot email, default PocketBase version for setup, and logging verbosity, are stored in `~/.pb-manager/cli-config.json`.
 4. **Data Isolation:** Each instance is given its own data directory under `~/.pb-manager/instances_data/`, ensuring that databases and files are kept separate.
 5. **PM2:** For each instance, `pb-manager` generates an entry in a PM2 ecosystem file (`~/.pb-manager/ecosystem.config.js`). PM2 is then used to run, monitor, and manage the lifecycle of these PocketBase processes.
 6. **Nginx:** When an instance is added, `pb-manager` generates a secure Nginx server block configuration file in `/etc/nginx/sites-available/` and creates a symbolic link in `/etc/nginx/sites-enabled/`. This configures Nginx to act as a reverse proxy, forwarding requests from a public domain to the instance's internal port, with optional HTTP/2 and upload size limit.
@@ -132,6 +133,7 @@ This interactive command allows you to:
 
 - Set/View the **Default Certbot Email**: The email address to be suggested or used by default when setting up HTTPS with Certbot for new instances.
 - Set/View the **Default PocketBase Version**: The version of PocketBase that the `setup` command will download by default if no specific version is provided (by default, always the latest).
+- **Enable/disable complete logging:** Toggle between concise and verbose output for all commands.
 - View the current raw JSON configuration.
 
 ---
@@ -308,6 +310,15 @@ If you choose not to create the superuser via CLI, you can always create it via 
 - **Upload Limit:** You can enable a 20MB upload limit (`client_max_body_size 20M`) for each instance.
 - **HTTPS:** Full Let's Encrypt integration with Certbot.
 - **Automatic HTTP to HTTPS redirection** when HTTPS is enabled.
+
+---
+
+## Logging
+
+You can enable or disable **complete logging** via the `configure` command.
+
+- When enabled, all commands and outputs (including shell commands, Nginx reloads, PM2 actions, etc.) are shown.
+- When disabled (default), only concise and essential output is shown.
 
 ---
 

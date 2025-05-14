@@ -20,6 +20,8 @@ const PM2_ECOSYSTEM_FILE = path.join(CONFIG_DIR, "ecosystem.config.js");
 const NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 const NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 
+let completeLogging = false;
+
 async function getLatestPocketBaseVersion() {
   try {
     const res = await axios.get("https://api.github.com/repos/pocketbase/pocketbase/releases/latest", { headers: { "User-Agent": "pb-manager" } });
@@ -27,7 +29,9 @@ async function getLatestPocketBaseVersion() {
       return res.data.tag_name.replace(/^v/, "");
     }
   } catch (e) {
-    console.error(chalk.red("Failed to fetch latest PocketBase version from GitHub. Using fallback version 0.28.1."));
+    if (completeLogging) {
+      console.error(chalk.red("Failed to fetch latest PocketBase version from GitHub. Using fallback version 0.28.1."));
+    }
   }
   return "0.28.1";
 }
@@ -40,15 +44,19 @@ async function getCliConfig() {
       return {
         defaultCertbotEmail: null,
         defaultPocketBaseVersion: latestVersion,
+        completeLogging: false,
         ...config,
       };
     } catch (e) {
-      console.warn(chalk.yellow("Could not read CLI config, using defaults."));
+      if (completeLogging) {
+        console.warn(chalk.yellow("Could not read CLI config, using defaults."));
+      }
     }
   }
   return {
     defaultCertbotEmail: null,
     defaultPocketBaseVersion: latestVersion,
+    completeLogging: false,
   };
 }
 
@@ -84,18 +92,23 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
   const versionToDownload = versionOverride || cliConfig.defaultPocketBaseVersion || (await getLatestPocketBaseVersion());
 
   if (!versionOverride && (await fs.pathExists(POCKETBASE_EXEC_PATH))) {
-    console.log(chalk.green(`PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Skipping download.`));
+    if (completeLogging) {
+      console.log(chalk.green(`PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Skipping download.`));
+    }
     return;
   }
 
   if (await fs.pathExists(POCKETBASE_EXEC_PATH)) {
-    console.log(chalk.yellow(`Removing existing PocketBase executable at ${POCKETBASE_EXEC_PATH} to download version ${versionToDownload}...`));
+    if (completeLogging) {
+      console.log(chalk.yellow(`Removing existing PocketBase executable at ${POCKETBASE_EXEC_PATH} to download version ${versionToDownload}...`));
+    }
     await fs.remove(POCKETBASE_EXEC_PATH);
   }
 
   const downloadUrl = `https://github.com/pocketbase/pocketbase/releases/download/v${versionToDownload}/pocketbase_${versionToDownload}_linux_amd64.zip`;
-  console.log(chalk.blue(`Downloading PocketBase v${versionToDownload} from ${downloadUrl}...`));
-
+  if (completeLogging) {
+    console.log(chalk.blue(`Downloading PocketBase v${versionToDownload} from ${downloadUrl}...`));
+  }
   try {
     const response = await axios({ url: downloadUrl, method: "GET", responseType: "stream" });
     const zipPath = path.join(POCKETBASE_BIN_DIR, "pocketbase.zip");
@@ -107,7 +120,10 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
       writer.on("error", reject);
     });
 
-    console.log(chalk.blue("Unzipping PocketBase..."));
+    if (completeLogging) {
+      console.log(chalk.blue("Unzipping PocketBase..."));
+    }
+
     await fs
       .createReadStream(zipPath)
       .pipe(unzipper.Extract({ path: POCKETBASE_BIN_DIR }))
@@ -115,7 +131,10 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
 
     await fs.remove(zipPath);
     await fs.chmod(POCKETBASE_EXEC_PATH, "755");
-    console.log(chalk.green(`PocketBase v${versionToDownload} downloaded and extracted successfully to ${POCKETBASE_EXEC_PATH}.`));
+
+    if (completeLogging) {
+      console.log(chalk.green(`PocketBase v${versionToDownload} downloaded and extracted successfully to ${POCKETBASE_EXEC_PATH}.`));
+    }
   } catch (error) {
     console.error(chalk.red(`Error downloading or extracting PocketBase v${versionToDownload}:`), error.message);
     if (error.response && error.response.status === 404) {
@@ -126,11 +145,15 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
 }
 
 function runCommand(command, errorMessage, ignoreError = false) {
-  console.log(chalk.yellow(`Executing: ${command}`));
-  const result = shell.exec(command, { silent: false });
+  if (completeLogging) {
+    console.log(chalk.yellow(`Executing: ${command}`));
+  }
+  const result = shell.exec(command, { silent: !completeLogging });
   if (result.code !== 0 && !ignoreError) {
     console.error(chalk.red(errorMessage || `Error executing command: ${command}`));
-    console.error(chalk.red(result.stderr));
+    if (completeLogging) {
+      console.error(chalk.red(result.stderr));
+    }
     throw new Error(errorMessage || `Command failed: ${command}`);
   }
   return result;
@@ -233,22 +256,30 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
   const nginxConfPath = path.join(NGINX_SITES_AVAILABLE, instanceName);
   const nginxEnabledPath = path.join(NGINX_SITES_ENABLED, instanceName);
 
-  console.log(chalk.blue(`Generating Nginx config for ${instanceName} at ${nginxConfPath}`));
+  if (completeLogging) {
+    console.log(chalk.blue(`Generating Nginx config for ${instanceName} at ${nginxConfPath}`));
+    console.log(chalk.blue(`Creating Nginx symlink: ${nginxEnabledPath}`));
+  }
   await fs.writeFile(nginxConfPath, configContent.trim());
-  console.log(chalk.blue(`Creating Nginx symlink: ${nginxEnabledPath}`));
   try {
     runCommand(`sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`);
   } catch (error) {
-    console.error(chalk.red("Failed to create symlink. Try running with sudo or create it manually."));
-    console.log(`Manually run: sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`);
+    if (completeLogging) {
+      console.error(chalk.red("Failed to create symlink. Try running with sudo or create it manually."));
+      console.log(`Manually run: sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`);
+    }
   }
 }
 
 async function reloadNginx() {
-  console.log(chalk.blue("Testing Nginx configuration..."));
+  if (completeLogging) {
+    console.log(chalk.blue("Testing Nginx configuration..."));
+  }
   try {
     runCommand("sudo nginx -t");
-    console.log(chalk.blue("Reloading Nginx..."));
+    if (completeLogging) {
+      console.log(chalk.blue("Reloading Nginx..."));
+    }
     runCommand("sudo systemctl reload nginx");
     console.log(chalk.green("Nginx reloaded successfully."));
   } catch (error) {
@@ -262,7 +293,9 @@ async function runCertbot(domain, email) {
     console.error(chalk.red("Certbot command not found. Please install Certbot first."));
     return false;
   }
-  console.log(chalk.blue(`Attempting to obtain SSL certificate for ${domain} using Certbot...`));
+  if (completeLogging) {
+    console.log(chalk.blue(`Attempting to obtain SSL certificate for ${domain} using Certbot...`));
+  }
   try {
     runCommand("sudo mkdir -p /var/www/html", "Creating /var/www/html for Certbot", true);
   } catch (e) {}
@@ -270,7 +303,9 @@ async function runCertbot(domain, email) {
   const certbotCommand = `sudo certbot --nginx -d ${domain} --non-interactive --agree-tos -m "${email}" --redirect`;
   try {
     runCommand(certbotCommand, "Certbot command failed.");
-    console.log(chalk.green(`Certbot successfully obtained and installed certificate for ${domain}.`));
+    if (completeLogging) {
+      console.log(chalk.green(`Certbot successfully obtained and installed certificate for ${domain}.`));
+    }
     return true;
   } catch (error) {
     console.error(chalk.red(`Certbot failed for ${domain}. Check Certbot logs.`));
@@ -284,13 +319,14 @@ program
   .action(async () => {
     await ensureBaseSetup();
     const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
 
     const { action } = await inquirer.prompt([
       {
         type: "list",
         name: "action",
         message: "CLI Configuration:",
-        choices: [{ name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`, value: "setEmail" }, { name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`, value: "setPbVersion" }, new inquirer.Separator(), { name: "View current JSON config", value: "viewConfig" }, { name: "Exit", value: "exit" }],
+        choices: [{ name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`, value: "setEmail" }, { name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`, value: "setPbVersion" }, { name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`, value: "setLogging" }, new inquirer.Separator(), { name: "View current JSON config", value: "viewConfig" }, { name: "Exit", value: "exit" }],
       },
     ]);
 
@@ -324,6 +360,21 @@ program
         console.log(chalk.green("Default PocketBase version updated."));
         break;
       }
+      case "setLogging": {
+        const { enableLogging } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "enableLogging",
+            message: "Enable complete logging (show all commands and outputs)?",
+            default: cliConfig.completeLogging || false,
+          },
+        ]);
+        cliConfig.completeLogging = enableLogging;
+        await saveCliConfig(cliConfig);
+        completeLogging = enableLogging;
+        console.log(chalk.green(`Complete logging is now ${enableLogging ? "enabled" : "disabled"}.`));
+        break;
+      }
       case "viewConfig":
         console.log(chalk.cyan("Current CLI Configuration:"));
         console.log(JSON.stringify(cliConfig, null, 2));
@@ -343,6 +394,8 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
+    const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
     console.log(chalk.bold.cyan("Starting PocketBase Manager Setup..."));
     await ensureBaseSetup();
     await downloadPocketBaseIfNotExists(options.version);
@@ -357,9 +410,13 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
+    const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
     await ensureBaseSetup();
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
-      console.log(chalk.yellow("PocketBase executable not found. Running setup..."));
+      if (completeLogging) {
+        console.log(chalk.yellow("PocketBase executable not found. Running setup..."));
+      }
       await downloadPocketBaseIfNotExists();
       if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
         console.error(chalk.red("PocketBase download failed. Cannot add instance."));
@@ -411,8 +468,7 @@ program
       return;
     }
 
-    const cliConf = await getCliConfig();
-    let emailToUseForCertbot = cliConf.defaultCertbotEmail;
+    let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
 
     const httpsAnswers = await inquirer.prompt([
       {
@@ -424,17 +480,17 @@ program
       {
         type: "confirm",
         name: "useDefaultEmail",
-        message: `Use default email (${cliConf.defaultCertbotEmail}) for Let's Encrypt?`,
+        message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`,
         default: true,
-        when: (answers) => answers.useHttps && cliConf.defaultCertbotEmail,
+        when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail,
       },
       {
         type: "input",
         name: "emailForCertbot",
         message: "Enter email for Let's Encrypt:",
-        when: (answers) => answers.useHttps && (!cliConf.defaultCertbotEmail || !answers.useDefaultEmail),
+        when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail),
         validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."),
-        default: (answers) => (!cliConf.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConf.defaultCertbotEmail),
+        default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConfig.defaultCertbotEmail),
       },
       {
         type: "confirm",
@@ -446,8 +502,8 @@ program
     ]);
 
     if (httpsAnswers.useHttps) {
-      if (cliConf.defaultCertbotEmail && httpsAnswers.useDefaultEmail) {
-        emailToUseForCertbot = cliConf.defaultCertbotEmail;
+      if (cliConfig.defaultCertbotEmail && httpsAnswers.useDefaultEmail) {
+        emailToUseForCertbot = cliConfig.defaultCertbotEmail;
       } else {
         emailToUseForCertbot = httpsAnswers.emailForCertbot;
       }
@@ -481,8 +537,10 @@ program
     if (httpsAnswers.useHttps && httpsAnswers.autoRunCertbot) {
       certbotSuccess = await runCertbot(initialAnswers.domain, emailToUseForCertbot);
     } else if (httpsAnswers.useHttps && !httpsAnswers.autoRunCertbot) {
-      console.log(chalk.yellow("Skipping automatic Certbot execution."));
-      console.log(chalk.yellow(`To obtain a certificate later, you can try running: sudo certbot --nginx -d ${initialAnswers.domain} -m ${emailToUseForCertbot}`));
+      if (completeLogging) {
+        console.log(chalk.yellow("Skipping automatic Certbot execution."));
+        console.log(chalk.yellow(`To obtain a certificate later, you can try running: sudo certbot --nginx -d ${initialAnswers.domain} -m ${emailToUseForCertbot}`));
+      }
     }
 
     await updatePm2EcosystemFile();
@@ -517,10 +575,15 @@ program
       ]);
 
       const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${instanceDataDir}"`;
-      console.log(chalk.blue("\nAttempting to create superuser (admin) account via CLI..."));
-
+      if (completeLogging) {
+        console.log(chalk.blue("\nAttempting to create superuser (admin) account via CLI..."));
+        console.log(chalk.yellow(`Executing: ${adminCreateCommand}`));
+      }
       try {
-        runCommand(adminCreateCommand, "Failed to create superuser (admin) account via CLI.");
+        const result = runCommand(adminCreateCommand, "Failed to create superuser (admin) account via CLI.");
+        if (result?.stdout?.includes("Successfully created new superuser")) {
+          console.log(result.stdout.trim());
+        }
         console.log(chalk.green(`Superuser (admin) account for ${adminCredentials.adminEmail} created successfully!`));
         adminCreatedViaCli = true;
       } catch (e) {
@@ -565,22 +628,30 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
+    const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
     console.log(chalk.bold.cyan("Attempting to update PocketBase executable..."));
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       console.error(chalk.red("PocketBase executable not found. Run 'setup' or 'configure' to set a version and download."));
       return;
     }
     try {
-      console.log(chalk.yellow(`Running: ${POCKETBASE_EXEC_PATH} update`));
-      const updateResult = shell.exec(`${POCKETBASE_EXEC_PATH} update`, { cwd: POCKETBASE_BIN_DIR });
+      if (completeLogging) {
+        console.log(chalk.yellow(`Running: ${POCKETBASE_EXEC_PATH} update`));
+      }
+      const updateResult = shell.exec(`${POCKETBASE_EXEC_PATH} update`, { cwd: POCKETBASE_BIN_DIR, silent: !completeLogging });
 
       if (updateResult.code !== 0) {
         console.error(chalk.red("PocketBase update command failed."));
-        console.error(updateResult.stderr);
+        if (completeLogging) {
+          console.error(updateResult.stderr);
+        }
         return;
       }
-      console.log(chalk.green("PocketBase executable update process finished."));
-      console.log(updateResult.stdout);
+      if (completeLogging) {
+        console.log(chalk.green("PocketBase executable update process finished."));
+        console.log(updateResult.stdout);
+      }
     } catch (error) {
       console.error(chalk.red("Failed to run PocketBase update command:"), error.message);
       return;
@@ -613,6 +684,8 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
+    const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
     const config = await getInstancesConfig();
     if (!config.instances[name]) {
       console.error(chalk.red(`Instance "${name}" not found.`));
@@ -633,30 +706,40 @@ program
       return;
     }
 
-    console.log(chalk.blue(`Stopping and removing PM2 process for pb-${name}...`));
+    if (completeLogging) {
+      console.log(chalk.blue(`Stopping and removing PM2 process for pb-${name}...`));
+    }
     try {
       runCommand(`pm2 stop pb-${name}`, `Stopping pb-${name}`, true);
       runCommand(`pm2 delete pb-${name}`, `Deleting pb-${name}`, true);
     } catch (error) {
-      console.warn(chalk.yellow(`Could not stop/delete PM2 process pb-${name} (maybe not running).`));
+      if (completeLogging) {
+        console.warn(chalk.yellow(`Could not stop/delete PM2 process pb-${name} (maybe not running).`));
+      }
     }
 
     const nginxConfPath = path.join(NGINX_SITES_AVAILABLE, name);
     const nginxEnabledPath = path.join(NGINX_SITES_ENABLED, name);
 
-    console.log(chalk.blue(`Removing Nginx config for ${name}...`));
+    if (completeLogging) {
+      console.log(chalk.blue(`Removing Nginx config for ${name}...`));
+    }
     if (await fs.pathExists(nginxEnabledPath)) {
       try {
         runCommand(`sudo rm ${nginxEnabledPath}`);
       } catch (error) {
-        console.error(chalk.red(`Failed to remove Nginx symlink. Try: sudo rm ${nginxEnabledPath}`));
+        if (completeLogging) {
+          console.error(chalk.red(`Failed to remove Nginx symlink. Try: sudo rm ${nginxEnabledPath}`));
+        }
       }
     }
     if (await fs.pathExists(nginxConfPath)) {
       try {
         runCommand(`sudo rm ${nginxConfPath}`);
       } catch (error) {
-        console.error(chalk.red(`Failed to remove Nginx available config. Try: sudo rm ${nginxConfPath}`));
+        if (completeLogging) {
+          console.error(chalk.red(`Failed to remove Nginx available config. Try: sudo rm ${nginxConfPath}`));
+        }
       }
     }
 
@@ -679,6 +762,8 @@ program
   .command("list")
   .description("List all managed PocketBase instances")
   .action(async () => {
+    const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
     const config = await getInstancesConfig();
     if (Object.keys(config.instances).length === 0) {
       console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
@@ -697,7 +782,9 @@ program
         }
       }
     } catch (e) {
-      console.warn(chalk.yellow("Could not fetch PM2 statuses. Is PM2 running?"));
+      if (completeLogging) {
+        console.warn(chalk.yellow("Could not fetch PM2 statuses. Is PM2 running?"));
+      }
     }
 
     for (const name in config.instances) {
@@ -723,6 +810,8 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
+    const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
     try {
       runCommand(`pm2 start pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} started.`));
@@ -739,6 +828,8 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
+    const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
     try {
       runCommand(`pm2 stop pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} stopped.`));
@@ -755,6 +846,8 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
+    const cliConfig = await getCliConfig();
+    completeLogging = cliConfig.completeLogging || false;
     try {
       runCommand(`pm2 restart pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} restarted.`));
@@ -771,6 +864,8 @@ program
       console.error(chalk.red("You must run this script as root or with sudo."));
       process.exit(1);
     }
+    const cliConfig = shell.test("-f", CLI_CONFIG_PATH) ? require(CLI_CONFIG_PATH) : {};
+    completeLogging = cliConfig.completeLogging || false;
     console.log(chalk.blue(`Displaying logs for pb-${name}. Press Ctrl+C to exit.`));
     shell.exec(`pm2 logs pb-${name} --lines 50`, { async: false });
   });
@@ -780,6 +875,8 @@ async function main() {
     console.error(chalk.red("You must run this script as root or with sudo."));
     process.exit(1);
   }
+  const cliConfig = await getCliConfig();
+  completeLogging = cliConfig.completeLogging || false;
   if (!shell.which("pm2")) {
     console.error(chalk.red("PM2 is not installed or not in PATH. Please install PM2: npm install -g pm2"));
     process.exit(1);
