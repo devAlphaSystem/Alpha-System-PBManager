@@ -1,6 +1,6 @@
 {
   "name": "alpha-system-pbmanager-cli",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "main": "pb-manager.js",
   "scripts": {
     "start": "node pb-manager.js",

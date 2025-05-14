@@ -4,6 +4,10 @@
 
 `pb-manager` is a command-line interface (CLI) tool designed to simplify the management of multiple PocketBase instances on a single Linux server. It automates setup, configuration, and ongoing maintenance tasks, including process management with PM2, reverse proxying with Nginx, SSL certificate handling with Certbot, secure Nginx configuration, and provides an interactive dashboard for instance monitoring.
 
+### Changelogs
+
+You can see the changelogs [here](https://docs.alphasystem.dev/view/45jq16tb74kd0v6).
+
 ### Why pb-manager?
 
 Running multiple web applications, like PocketBase instances, on one server can become complex. Each instance needs:
@@ -29,8 +33,6 @@ Running multiple web applications, like PocketBase instances, on one server can 
 - Offer an **interactive dashboard** to view instance status, resource usage, and perform quick actions.
 - Allow you to enable or disable **complete logging** for more or less verbose output.
 
----
-
 ## How It Works
 
 `pb-manager` orchestrates several components:
@@ -44,8 +46,6 @@ Running multiple web applications, like PocketBase instances, on one server can 
 7. **Certbot:** If HTTPS is enabled for an instance, `pb-manager` can attempt to run Certbot to obtain and install a Let's Encrypt SSL certificate for the specified domain. Certbot will modify the Nginx configuration to enable HTTPS.
 8. **Superuser Creation:** When adding a new instance, `pb-manager` offers to create the initial PocketBase superuser (admin) account via the CLI, or guides you to do it via the web UI.
 9. **Interactive Dashboard:** Uses `blessed` and `blessed-contrib` to render a terminal-based UI for real-time monitoring and management of instances.
-
----
 
 ## Prerequisites
 
@@ -65,8 +65,6 @@ Before using `pb-manager`, ensure the following are installed and configured on 
 6. **Firewall:** Ports 80 (HTTP) and 443 (HTTPS) must be open.
    - Example with `ufw`: `sudo ufw allow 'Nginx Full'` or `sudo ufw allow 80/tcp && sudo ufw allow 443/tcp`, then `sudo ufw enable`.
 7. **DNS Records:** For each domain/subdomain you intend to use, an A (and/or AAAA) record must point to your server's public IP address. This is crucial for Nginx and Certbot to function correctly.
-
----
 
 ## Installation
 
@@ -104,8 +102,6 @@ curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManag
    sudo ln -s $(pwd)/pb-manager.js /usr/local/bin/pb-manager
    ```
 
----
-
 ## Configuration Directory
 
 `pb-manager` stores all its configuration files, the PocketBase binary, and instance data within the `~/.pb-manager/` directory in the user's home directory who runs the script.
@@ -116,13 +112,9 @@ curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManag
 - `~/.pb-manager/bin/pocketbase`: The downloaded PocketBase executable.
 - `~/.pb-manager/instances_data/<instance-name>/`: Data directory for each instance (contains `pb_data`, `pb_migrations`, etc.).
 
----
-
 ## Commands
 
 All commands **must be run as root or with `sudo`**. Many commands that interact with system services like Nginx or PM2 require `sudo`.
-
----
 
 ### `dashboard`
 
@@ -144,8 +136,6 @@ All commands **must be run as root or with `sudo`**. Many commands that interact
   - `s`: Start/Stop the selected instance.
   - `d`: Delete the selected instance (will exit dashboard and run the remove command).
 
----
-
 ### `configure`
 
 **Purpose:** Set or view global CLI configurations for `pb-manager`.
@@ -160,8 +150,6 @@ This interactive command allows you to:
 - Set/View the **Default PocketBase Version**: The version of PocketBase that the `setup` command will download by default if no specific version is provided (by default, always the latest).
 - **Enable/disable complete logging:** Toggle between concise and verbose output for all commands.
 - View the current raw JSON configuration.
-
----
 
 ### `setup`
 
@@ -180,8 +168,6 @@ This interactive command allows you to:
 sudo pb-manager setup
 sudo pb-manager setup -v 0.28.1
 ```
-
----
 
 ### `add`
 
@@ -214,8 +200,6 @@ This interactive command will prompt you for:
 - Updates the PM2 ecosystem file and starts/reloads the PM2 processes.
 - Offers to create the initial PocketBase superuser (admin) account via CLI, or guides you to do it via the web UI.
 
----
-
 ### `list`
 
 **Purpose:** Lists all PocketBase instances currently managed by `pb-manager`.
@@ -232,8 +216,6 @@ Displays a summary for each instance, including:
 - Data Directory Path
 - PM2 Status (e.g., `online`, `stopped`, `errored`)
 - Local Admin URL (e.g., `http://127.0.0.1:PORT/_/`)
-
----
 
 ### `remove <name>`
 
@@ -257,16 +239,12 @@ This command will:
 
 **Important:** This command **does not** delete the instance's data directory (`~/.pb-manager/instances_data/<instance-name>/`). You must do this manually if you wish to remove the data.
 
----
-
 ### `start <name>`
 
 **Purpose:** Starts a specific, already configured PocketBase instance using PM2.
 
 **Usage:**  
 `sudo pb-manager start <instance-name>`
-
----
 
 ### `stop <name>`
 
@@ -275,16 +253,12 @@ This command will:
 **Usage:**  
 `sudo pb-manager stop <instance-name>`
 
----
-
 ### `restart <name>`
 
 **Purpose:** Restarts a specific PocketBase instance managed by PM2.
 
 **Usage:**  
 `sudo pb-manager restart <instance-name>`
-
----
 
 ### `logs <name>`
 
@@ -295,8 +269,6 @@ This command will:
 
 **Details:**  
 This command tails the logs. Press `Ctrl+C` to exit the log view.
-
----
 
 ### `update-pb`
 
@@ -311,8 +283,6 @@ This command tails the logs. Press `Ctrl+C` to exit the log view.
 - Runs `<path-to-pocketbase-executable> update`. This command makes the PocketBase binary update itself in place.
 - If the update is successful, it iterates through all managed instances and restarts their PM2 processes.
 
----
-
 ## Superuser (Admin) Account Creation
 
 When you add a new PocketBase instance, `pb-manager` will offer to create the initial superuser (admin) account via the CLI using the following command:
@@ -326,8 +296,6 @@ If you choose not to create the superuser via CLI, you can always create it via 
 - Visit `https://your-domain/_/` (or `http://127.0.0.1:<port>/_/` if accessing locally or via SSH port forwarding).
 - You will be prompted to create the first admin account.
 
----
-
 ## Nginx Configuration Features
 
 - **HTTP/2:** You can enable HTTP/2 for each instance.
@@ -336,16 +304,12 @@ If you choose not to create the superuser via CLI, you can always create it via 
 - **HTTPS:** Full Let's Encrypt integration with Certbot.
 - **Automatic HTTP to HTTPS redirection** when HTTPS is enabled.
 
----
-
 ## Logging
 
 You can enable or disable **complete logging** via the `configure` command.
 
 - When enabled, all commands and outputs (including shell commands, Nginx reloads, PM2 actions, etc.) are shown.
 - When disabled (default), only concise and essential output is shown.
-
----
 
 ## Potential Issues & Disclaimer
 
@@ -367,8 +331,6 @@ While `pb-manager` aims to automate and simplify server management tasks, it int
 - **Resource Exhaustion:** Running too many PocketBase instances on an under-powered server can lead to performance issues or crashes. Monitor your server resources.
 
 **Disclaimer:** This tool is provided as-is, without any warranty. The user assumes all responsibility for its use and any potential impact on their system. **Always back up critical data before performing significant system changes or running management scripts.**
-
----
 
 ## Important Notes
 
