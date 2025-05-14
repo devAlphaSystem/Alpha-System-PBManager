@@ -3,7 +3,7 @@
 set -e
 
 PB_MANAGER_GITHUB_USER="devAlphaSystem"
-PB_MANAGER_GITHUB_REPO="Alpha-System-PBManager-CLI"
+PB_MANAGER_GITHUB_REPO="Alpha-System-PBManager"
 PB_MANAGER_BRANCH="main"
 
 PB_MANAGER_SCRIPT_URL="https://raw.githubusercontent.com/${PB_MANAGER_GITHUB_USER}/${PB_MANAGER_GITHUB_REPO}/${PB_MANAGER_BRANCH}/pb-manager.js"

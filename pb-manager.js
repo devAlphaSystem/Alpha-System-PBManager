@@ -13,6 +13,7 @@ const Table = require("cli-table3");
 const prettyBytes = require("pretty-bytes");
 const blessed = require("blessed");
 const contrib = require("blessed-contrib");
+const dns = require("node:dns/promises");
 
 const CONFIG_DIR = path.join(process.env.HOME || os.homedir(), ".pb-manager");
 const CLI_CONFIG_PATH = path.join(CONFIG_DIR, "cli-config.json");
@@ -24,22 +25,118 @@ const PM2_ECOSYSTEM_FILE = path.join(CONFIG_DIR, "ecosystem.config.js");
 
 const NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 const NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
+const VERSION_CACHE_PATH = path.join(CONFIG_DIR, "version-cache.json");
 
 let completeLogging = false;
 
 let _latestPocketBaseVersionCache = null;
 const FALLBACK_POCKETBASE_VERSION = "0.28.1";
 
+async function validateDnsRecords(domain) {
+  try {
+    const publicIpRes = await axios.get("https://api.ipify.org?format=json");
+    const serverIp = publicIpRes.data.ip;
+
+    let domainResolved = false;
+    let pointsToServer = false;
+
+    try {
+      const aRecords = await dns.resolve4(domain);
+
+      domainResolved = true;
+
+      for (let i = 0; i < aRecords.length; i++) {
+        if (aRecords[i] === serverIp) {
+          pointsToServer = true;
+
+          break;
+        }
+      }
+    } catch (e) {}
+
+    if (!pointsToServer) {
+      try {
+        const aaaaRecords = await dns.resolve6(domain);
+
+        domainResolved = true;
+
+        for (let i = 0; i < aaaaRecords.length; i++) {
+          if (aaaaRecords[i] === serverIp) {
+            pointsToServer = true;
+
+            break;
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (!domainResolved) {
+      if (completeLogging) {
+        console.log(chalk.red(`Domain ${domain} could not be resolved. It might not exist.`));
+      }
+
+      return false;
+    }
+
+    if (!pointsToServer) {
+      if (completeLogging) {
+        console.log(chalk.yellow(`Domain ${domain} exists but doesn't point to this server (${serverIp}).`));
+      }
+    }
+
+    return pointsToServer;
+  } catch (e) {
+    if (completeLogging) {
+      console.log(chalk.red(`Error validating DNS records for ${domain}: ${e.message}`));
+    }
+
+    return false;
+  }
+}
+
+async function getCachedLatestVersion() {
+  const now = Date.now();
+
+  try {
+    if (await fs.pathExists(VERSION_CACHE_PATH)) {
+      try {
+        const cache = await fs.readJson(VERSION_CACHE_PATH);
+        if (cache && typeof cache.timestamp === "number" && typeof cache.latestVersion === "string" && now - cache.timestamp < 24 * 60 * 60 * 1000) {
+          return cache.latestVersion;
+        }
+      } catch (e) {}
+    }
+
+    const latestVersion = await getLatestPocketBaseVersion(true);
+
+    await fs.ensureDir(path.dirname(VERSION_CACHE_PATH));
+    await fs.writeJson(VERSION_CACHE_PATH, {
+      timestamp: now,
+      latestVersion,
+    });
+
+    return latestVersion;
+  } catch (e) {
+    if (completeLogging) {
+      console.log(chalk.yellow(`Error with version cache: ${e.message}. Fetching directly.`));
+    }
+
+    return await getLatestPocketBaseVersion(false);
+  }
+}
+
 async function getLatestPocketBaseVersion(forceRefresh = false) {
   if (_latestPocketBaseVersionCache && !forceRefresh) {
     return _latestPocketBaseVersionCache;
   }
+
   try {
     const res = await axios.get("https://api.github.com/repos/pocketbase/pocketbase/releases/latest", { headers: { "User-Agent": "pb-manager" } });
     if (res.data?.tag_name) {
       _latestPocketBaseVersionCache = res.data.tag_name.replace(/^v/, "");
       return _latestPocketBaseVersionCache;
     }
+
     if (completeLogging) {
       console.warn(chalk.yellow(`Could not determine latest PocketBase version from GitHub API response. Using fallback ${FALLBACK_POCKETBASE_VERSION}.`));
     }
@@ -48,6 +145,7 @@ async function getLatestPocketBaseVersion(forceRefresh = false) {
       console.error(chalk.red(`Failed to fetch latest PocketBase version from GitHub: ${e.message}. Using fallback version ${FALLBACK_POCKETBASE_VERSION}.`));
     }
   }
+
   _latestPocketBaseVersionCache = FALLBACK_POCKETBASE_VERSION;
   return _latestPocketBaseVersionCache;
 }
@@ -66,6 +164,7 @@ async function getCliConfig() {
       if (!config.defaultPocketBaseVersion || typeof config.defaultPocketBaseVersion !== "string" || !/^\d+\.\d+\.\d+$/.test(config.defaultPocketBaseVersion)) {
         config.defaultPocketBaseVersion = latestVersion;
       }
+
       return { ...defaults, ...config };
     } catch (e) {
       if (completeLogging) {
@@ -73,6 +172,7 @@ async function getCliConfig() {
       }
     }
   }
+
   return defaults;
 }
 
@@ -85,12 +185,15 @@ async function ensureBaseSetup() {
   await fs.ensureDir(CONFIG_DIR);
   await fs.ensureDir(POCKETBASE_BIN_DIR);
   await fs.ensureDir(INSTANCES_DATA_BASE_DIR);
+
   if (!(await fs.pathExists(INSTANCES_CONFIG_PATH))) {
     await fs.writeJson(INSTANCES_CONFIG_PATH, { instances: {} });
   }
+
   if (!(await fs.pathExists(PM2_ECOSYSTEM_FILE))) {
     await fs.writeFile(PM2_ECOSYSTEM_FILE, "module.exports = { apps: [] };");
   }
+
   const currentCliConfig = await getCliConfig();
   await saveCliConfig(currentCliConfig);
 }
@@ -111,6 +214,7 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
     if (completeLogging) {
       console.log(chalk.green(`PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Skipping download.`));
     }
+
     return;
   }
 
@@ -118,19 +222,23 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
     if (completeLogging) {
       console.log(chalk.yellow(`Removing existing PocketBase executable at ${POCKETBASE_EXEC_PATH} to download version ${versionToDownload}...`));
     }
+
     await fs.remove(POCKETBASE_EXEC_PATH);
   }
 
   const downloadUrl = `https://github.com/pocketbase/pocketbase/releases/download/v${versionToDownload}/pocketbase_${versionToDownload}_linux_amd64.zip`;
+
   if (completeLogging) {
     console.log(chalk.blue(`Downloading PocketBase v${versionToDownload} from ${downloadUrl}...`));
   }
+
   try {
     const response = await axios({
       url: downloadUrl,
       method: "GET",
       responseType: "stream",
     });
+
     const zipPath = path.join(POCKETBASE_BIN_DIR, "pocketbase.zip");
     const writer = fs.createWriteStream(zipPath);
     response.data.pipe(writer);
@@ -157,9 +265,11 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
     }
   } catch (error) {
     console.error(chalk.red(`Error downloading or extracting PocketBase v${versionToDownload}:`), error.message);
+
     if (error.response && error.response.status === 404) {
       console.error(chalk.red(`Version ${versionToDownload} not found. Please check the version number.`));
     }
+
     throw error;
   }
 }
@@ -168,22 +278,28 @@ function runCommand(command, errorMessage, ignoreError = false) {
   if (completeLogging) {
     console.log(chalk.yellow(`Executing: ${command}`));
   }
+
   const result = shell.exec(command, { silent: !completeLogging });
   if (result.code !== 0 && !ignoreError) {
     console.error(chalk.red(errorMessage || `Error executing command: ${command}`));
+
     if (completeLogging) {
       console.error(chalk.red(result.stderr));
     }
+
     throw new Error(errorMessage || `Command failed: ${command}`);
   }
+
   return result;
 }
 
 async function updatePm2EcosystemFile() {
   const config = await getInstancesConfig();
   const apps = [];
+
   for (const instName in config.instances) {
     const inst = config.instances[instName];
+
     apps.push({
       name: `pb-${inst.name}`,
       script: POCKETBASE_EXEC_PATH,
@@ -195,8 +311,11 @@ async function updatePm2EcosystemFile() {
       env: { NODE_ENV: "production" },
     });
   }
+
   const ecosystemContent = `module.exports = { apps: ${JSON.stringify(apps, null, 2)} };`;
+
   await fs.writeFile(PM2_ECOSYSTEM_FILE, ecosystemContent);
+
   console.log(chalk.green("PM2 ecosystem file updated."));
 }
 
@@ -206,7 +325,9 @@ async function reloadPm2(specificInstanceName = null) {
   } else {
     runCommand(`pm2 reload ${PM2_ECOSYSTEM_FILE}`);
   }
+
   runCommand("pm2 save");
+
   console.log(chalk.green(specificInstanceName ? `PM2 process pb-${specificInstanceName} restarted and PM2 state saved.` : "PM2 ecosystem reloaded and PM2 state saved."));
 }
 
@@ -218,7 +339,9 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     add_header X-XSS-Protection "1; mode=block" always;`;
   const clientMaxBody = maxBody20Mb ? "client_max_body_size 20M;" : "";
   const http2 = useHttp2 ? " http2" : "";
+
   let configContent;
+
   if (useHttps) {
     configContent = `
       server {
@@ -284,7 +407,9 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     console.log(chalk.blue(`Generating Nginx config for ${instanceName} at ${nginxConfPath}`));
     console.log(chalk.blue(`Creating Nginx symlink: ${nginxEnabledPath}`));
   }
+
   await fs.writeFile(nginxConfPath, configContent.trim());
+
   try {
     runCommand(`sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`);
   } catch (error) {
@@ -299,15 +424,20 @@ async function reloadNginx() {
   if (completeLogging) {
     console.log(chalk.blue("Testing Nginx configuration..."));
   }
+
   try {
     runCommand("sudo nginx -t");
+
     if (completeLogging) {
       console.log(chalk.blue("Reloading Nginx..."));
     }
+
     runCommand("sudo systemctl reload nginx");
+
     console.log(chalk.green("Nginx reloaded successfully."));
   } catch (error) {
     console.error(chalk.red("Nginx test failed or reload failed. Please check Nginx configuration."));
+
     throw error;
   }
 }
@@ -318,9 +448,12 @@ async function ensureDhParamExists() {
     if (completeLogging) {
       console.log(chalk.yellow(`${dhParamPath} not found. Generating... This may take a few minutes.`));
     }
+
     try {
       await fs.ensureDir("/etc/letsencrypt");
+
       runCommand(`sudo openssl dhparam -out ${dhParamPath} 2048`, `Failed to generate ${dhParamPath}. Nginx might fail to reload.`);
+
       if (completeLogging) {
         console.log(chalk.green(`${dhParamPath} generated successfully.`));
       }
@@ -337,31 +470,40 @@ async function ensureDhParamExists() {
 async function runCertbot(domain, email) {
   if (!shell.which("certbot")) {
     console.error(chalk.red("Certbot command not found. Please install Certbot first."));
+
     return false;
   }
+
   if (completeLogging) {
     console.log(chalk.blue(`Attempting to obtain SSL certificate for ${domain} using Certbot...`));
   }
+
   try {
     runCommand("sudo mkdir -p /var/www/html", "Creating /var/www/html for Certbot", true);
   } catch (e) {}
 
   const certbotCommand = `sudo certbot --nginx -d ${domain} --non-interactive --agree-tos -m "${email}" --redirect`;
+
   try {
     runCommand(certbotCommand, "Certbot command failed.");
+
     if (completeLogging) {
       console.log(chalk.green(`Certbot successfully obtained and installed certificate for ${domain}.`));
     }
+
     return true;
   } catch (error) {
     console.error(chalk.red(`Certbot failed for ${domain}. Check Certbot logs.`));
+
     return false;
   }
 }
 
 async function getInstanceUsageAnalytics(instances) {
   const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
+
   let pm2List = [];
+
   if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
     try {
       pm2List = JSON.parse(pm2ListRaw.stdout);
@@ -369,31 +511,41 @@ async function getInstanceUsageAnalytics(instances) {
       if (completeLogging) {
         console.error(chalk.red("Failed to parse pm2 jlist output."));
       }
+
       pm2List = [];
     }
   }
+
   const usage = [];
+
   for (const name in instances) {
     const inst = instances[name];
+
     let pm2Proc;
+
     for (const proc of pm2List) {
       if (proc.name === `pb-${name}`) {
         pm2Proc = proc;
         break;
       }
     }
+
     const status = pm2Proc ? pm2Proc.pm2_env.status : "offline";
     const cpu = pm2Proc?.monit ? pm2Proc.monit.cpu : 0;
     const mem = pm2Proc?.monit ? pm2Proc.monit.memory : 0;
     const uptime = pm2Proc?.pm2_env.pm_uptime ? Date.now() - pm2Proc.pm2_env.pm_uptime : 0;
     const dataDir = inst.dataDir;
+
     let dataSize = 0;
+
     try {
       if (await fs.pathExists(dataDir)) {
         dataSize = await getDirectorySize(dataDir);
       }
     } catch (e) {}
+
     let httpStatus = "-";
+
     try {
       const url = `http://127.0.0.1:${inst.port}/api/health`;
       const res = await axios.get(url, { timeout: 1000 }).catch(() => null);
@@ -401,6 +553,7 @@ async function getInstanceUsageAnalytics(instances) {
     } catch (e) {
       httpStatus = "ERR";
     }
+
     usage.push({
       name,
       domain: inst.domain,
@@ -414,11 +567,13 @@ async function getInstanceUsageAnalytics(instances) {
       ssl: inst.useHttps ? "Yes" : "No",
     });
   }
+
   return usage;
 }
 
 async function getDirectorySize(dir) {
   let total = 0;
+
   const files = await fs.readdir(dir);
   for (const file of files) {
     const filePath = path.join(dir, file);
@@ -429,6 +584,7 @@ async function getDirectorySize(dir) {
       total += stat.size;
     }
   }
+
   return total;
 }
 
@@ -446,17 +602,21 @@ function formatUptime(ms) {
 
 async function showDashboard() {
   await ensureBaseSetup();
+
   const config = await getInstancesConfig();
   const instanceNames = Object.keys(config.instances);
   if (instanceNames.length === 0) {
     console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
     return;
   }
+
   const screen = blessed.screen({
     smartCSR: true,
     title: "PocketBase Manager Dashboard",
   });
+
   const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
+
   const table = grid.set(0, 0, 10, 12, contrib.table, {
     keys: true,
     fg: "white",
@@ -470,6 +630,7 @@ async function showDashboard() {
     columnSpacing: 2,
     columnWidth: [12, 24, 7, 10, 8, 10, 10, 8, 8, 8],
   });
+
   const help = grid.set(10, 0, 2, 12, blessed.box, {
     content: " [q] Quit  [r] Refresh  [l] Logs  [s] Start/Stop  [d] Delete",
     tags: true,
@@ -482,24 +643,32 @@ async function showDashboard() {
   async function refreshTable() {
     const usage = await getInstanceUsageAnalytics(config.instances);
     currentData = usage;
+
     const data = [];
+
     for (const u of usage) {
       data.push([u.name, u.domain, u.port, u.status, u.httpStatus, u.ssl, `${u.cpu}%`, prettyBytes(u.mem), formatUptime(u.uptime), prettyBytes(u.dataSize)]);
     }
+
     table.setData({
       headers: ["Name", "Domain", "Port", "Status", "HTTP", "SSL", "CPU", "Mem", "Uptime", "Data"],
       data,
     });
+
     if (data.length > 0) {
       if (selectedIndex >= data.length) selectedIndex = data.length - 1;
-      if (selectedIndex < 0) selectedIndex = 0; // Ensure not negative
+      if (selectedIndex < 0) selectedIndex = 0;
+
       table.rows.select(selectedIndex);
     }
+
     screen.render();
   }
 
   await refreshTable();
+
   const interval = setInterval(refreshTable, 2000);
+
   table.focus();
 
   table.rows.on("select", (_, idx) => {
@@ -510,6 +679,7 @@ async function showDashboard() {
     if (key && key.name === "up") {
       selectedIndex = Math.max(0, table.rows.selected);
     }
+
     if (key && key.name === "down") {
       selectedIndex = Math.min(currentData.length - 1, table.rows.selected);
     }
@@ -517,44 +687,61 @@ async function showDashboard() {
 
   screen.key(["q", "C-c"], () => {
     clearInterval(interval);
+
     return process.exit(0);
   });
+
   screen.key(["r"], async () => {
     await refreshTable();
   });
+
   screen.key(["l"], () => {
     const idx = table.rows.selected;
+
     if (idx >= 0 && idx < currentData.length) {
       const name = currentData[idx].name;
+
       screen.destroy();
+
       clearInterval(interval);
+
       shell.exec(`pm2 logs pb-${name} --lines 50`);
+
       process.exit(0);
     }
   });
+
   screen.key(["s"], async () => {
     const idx = table.rows.selected;
     if (idx >= 0 && idx < currentData.length) {
       const name = currentData[idx].name;
       const inst = currentData[idx];
+
       if (inst.status === "online") {
         runCommand(`pm2 stop pb-${name}`);
       } else {
         runCommand(`pm2 start pb-${name}`);
       }
+
       await refreshTable();
     }
   });
+
   screen.key(["d"], async () => {
     const idx = table.rows.selected;
     if (idx >= 0 && idx < currentData.length) {
       const name = currentData[idx].name;
+
       screen.destroy();
+
       clearInterval(interval);
+
       shell.exec(`pb-manager remove ${name}`);
+
       process.exit(0);
     }
   });
+
   screen.render();
 }
 
@@ -564,8 +751,10 @@ program
   .action(async () => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     await showDashboard();
   });
 
@@ -574,6 +763,7 @@ program
   .description("Set or view CLI configurations (e.g., default Certbot email, PocketBase version).")
   .action(async () => {
     await ensureBaseSetup();
+
     const cliConfig = await getCliConfig();
 
     const { action } = await inquirer.prompt([
@@ -611,9 +801,13 @@ program
             default: cliConfig.defaultCertbotEmail,
           },
         ]);
+
         cliConfig.defaultCertbotEmail = email || null;
+
         await saveCliConfig(cliConfig);
+
         console.log(chalk.green("Default Certbot email updated."));
+
         break;
       }
       case "setPbVersion": {
@@ -626,9 +820,13 @@ program
             validate: (input) => (/^(\d+\.\d+\.\d+)$/.test(input) || input === "" ? true : "Please enter a valid version (x.y.z) or leave blank."),
           },
         ]);
+
         cliConfig.defaultPocketBaseVersion = version || (await getLatestPocketBaseVersion());
+
         await saveCliConfig(cliConfig);
+
         console.log(chalk.green("Default PocketBase version updated."));
+
         break;
       }
       case "setLogging": {
@@ -640,18 +838,25 @@ program
             default: cliConfig.completeLogging || false,
           },
         ]);
+
         cliConfig.completeLogging = enableLogging;
+
         await saveCliConfig(cliConfig);
+
         completeLogging = enableLogging;
+
         console.log(chalk.green(`Complete logging is now ${enableLogging ? "enabled" : "disabled"}.`));
+
         break;
       }
       case "viewConfig":
         console.log(chalk.cyan("Current CLI Configuration:"));
         console.log(JSON.stringify(cliConfig, null, 2));
+
         break;
       case "exit":
         console.log(chalk.blue("Exiting configuration."));
+
         break;
     }
   });
@@ -663,11 +868,15 @@ program
   .action(async (options) => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     console.log(chalk.bold.cyan("Starting PocketBase Manager Setup..."));
+
     await ensureBaseSetup();
     await downloadPocketBaseIfNotExists(options.version);
+
     console.log(chalk.bold.green("Setup complete!"));
   });
 
@@ -677,17 +886,24 @@ program
   .action(async () => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     const cliConfig = await getCliConfig();
+
     await ensureBaseSetup();
+
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       if (completeLogging) {
         console.log(chalk.yellow("PocketBase executable not found. Running setup..."));
       }
+
       await downloadPocketBaseIfNotExists();
+
       if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
         console.error(chalk.red("PocketBase download failed. Cannot add instance."));
+
         return;
       }
     }
@@ -729,11 +945,14 @@ program
     const config = await getInstancesConfig();
     if (config.instances[initialAnswers.name]) {
       console.error(chalk.red(`Instance "${initialAnswers.name}" already exists.`));
+
       return;
     }
+
     for (const instName in config.instances) {
       if (config.instances[instName].port === initialAnswers.port) {
         console.error(chalk.red(`Port ${initialAnswers.port} is already in use by another managed instance.`));
+
         return;
       }
     }
@@ -772,13 +991,22 @@ program
     ]);
 
     if (httpsAnswers.useHttps) {
+      const dnsValid = await validateDnsRecords(initialAnswers.domain);
+      if (!dnsValid) {
+        console.error(chalk.red(`DNS validation failed for domain ${initialAnswers.domain} - DNS records do not point to this server.`));
+
+        return;
+      }
+
       if (cliConfig.defaultCertbotEmail && httpsAnswers.useDefaultEmail) {
         emailToUseForCertbot = cliConfig.defaultCertbotEmail;
       } else {
         emailToUseForCertbot = httpsAnswers.emailForCertbot;
       }
+
       if (!emailToUseForCertbot) {
         console.error(chalk.red("Certbot email is required for HTTPS setup. Aborting."));
+
         return;
       }
     }
@@ -798,9 +1026,11 @@ program
     };
 
     await saveInstancesConfig(config);
+
     console.log(chalk.green(`Instance "${initialAnswers.name}" configuration saved.`));
 
     let certbotSuccess = false;
+
     const nginxConfigParams = {
       instanceName: initialAnswers.name,
       domain: initialAnswers.domain,
@@ -808,11 +1038,14 @@ program
       useHttp2: initialAnswers.useHttp2,
       maxBody20Mb: initialAnswers.maxBody20Mb,
     };
+
     if (httpsAnswers.useHttps) {
       await ensureDhParamExists();
+
       if (httpsAnswers.autoRunCertbot) {
         await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, false, nginxConfigParams.maxBody20Mb);
         await reloadNginx();
+
         certbotSuccess = await runCertbot(initialAnswers.domain, emailToUseForCertbot);
         if (certbotSuccess) {
           await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
@@ -821,6 +1054,7 @@ program
         }
       } else {
         await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
+
         console.log(chalk.yellow(`To obtain a certificate later, you can try running: sudo certbot --nginx -d ${initialAnswers.domain} -m ${emailToUseForCertbot}`));
       }
     } else {
@@ -860,16 +1094,21 @@ program
       ]);
 
       const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${instanceDataDir}"`;
+
       if (completeLogging) {
         console.log(chalk.blue("\nAttempting to create superuser (admin) account via CLI..."));
         console.log(chalk.yellow(`Executing: ${adminCreateCommand}`));
       }
+
       try {
         const result = runCommand(adminCreateCommand, "Failed to create superuser (admin) account via CLI.");
+
         if (result?.stdout?.includes("Successfully created new superuser")) {
           console.log(result.stdout.trim());
         }
+
         console.log(chalk.green(`Superuser (admin) account for ${adminCredentials.adminEmail} created successfully!`));
+
         adminCreatedViaCli = true;
       } catch (e) {
         console.error(chalk.red("Superuser (admin) account creation via CLI failed. Please try creating it via the web UI."));
@@ -911,17 +1150,23 @@ program
   .action(async () => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     console.log(chalk.bold.cyan("Attempting to update PocketBase executable..."));
+
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       console.error(chalk.red("PocketBase executable not found. Run 'setup' or 'configure' to set a version and download."));
+
       return;
     }
+
     try {
       if (completeLogging) {
         console.log(chalk.yellow(`Running: ${POCKETBASE_EXEC_PATH} update`));
       }
+
       const updateResult = shell.exec(`${POCKETBASE_EXEC_PATH} update`, {
         cwd: POCKETBASE_BIN_DIR,
         silent: !completeLogging,
@@ -929,32 +1174,42 @@ program
 
       if (updateResult.code !== 0) {
         console.error(chalk.red("PocketBase update command failed."));
+
         if (completeLogging) {
           console.error(updateResult.stderr);
         }
+
         return;
       }
+
       if (completeLogging) {
         console.log(chalk.green("PocketBase executable update process finished."));
         console.log(updateResult.stdout);
       }
     } catch (error) {
       console.error(chalk.red("Failed to run PocketBase update command:"), error.message);
+
       return;
     }
 
     console.log(chalk.blue("Restarting all PocketBase instances via PM2..."));
+
     const instancesConf = await getInstancesConfig();
+
     let allRestarted = true;
+
     for (const instanceName in instancesConf.instances) {
       try {
         runCommand(`pm2 restart pb-${instanceName}`);
+
         console.log(chalk.green(`Instance pb-${instanceName} restarted.`));
       } catch (e) {
         console.error(chalk.red(`Failed to restart instance pb-${instanceName}.`));
+
         allRestarted = false;
       }
     }
+
     if (allRestarted) {
       console.log(chalk.bold.green("All instances restarted."));
     } else {
@@ -968,11 +1223,14 @@ program
   .action(async (name) => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     const config = await getInstancesConfig();
     if (!config.instances[name]) {
       console.error(chalk.red(`Instance "${name}" not found.`));
+
       return;
     }
 
@@ -993,6 +1251,7 @@ program
     if (completeLogging) {
       console.log(chalk.blue(`Stopping and removing PM2 process for pb-${name}...`));
     }
+
     try {
       runCommand(`pm2 stop pb-${name}`, `Stopping pb-${name}`, true);
       runCommand(`pm2 delete pb-${name}`, `Deleting pb-${name}`, true);
@@ -1008,6 +1267,7 @@ program
     if (completeLogging) {
       console.log(chalk.blue(`Removing Nginx config for ${name}...`));
     }
+
     if (await fs.pathExists(nginxEnabledPath)) {
       try {
         runCommand(`sudo rm ${nginxEnabledPath}`);
@@ -1017,6 +1277,7 @@ program
         }
       }
     }
+
     if (await fs.pathExists(nginxConfPath)) {
       try {
         runCommand(`sudo rm ${nginxConfPath}`);
@@ -1028,10 +1289,13 @@ program
     }
 
     delete config.instances[name];
+
     await saveInstancesConfig(config);
+
     console.log(chalk.green(`Instance "${name}" removed from configuration.`));
 
     await updatePm2EcosystemFile();
+
     try {
       runCommand("pm2 save");
     } catch (e) {}
@@ -1051,10 +1315,14 @@ program
       console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
       return;
     }
+
     console.log(chalk.bold.cyan("Managed PocketBase Instances:"));
+
     const pm2Statuses = {};
+
     try {
       const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
+
       if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
         const pm2List = JSON.parse(pm2ListRaw.stdout);
         for (const proc of pm2List) {
@@ -1074,6 +1342,7 @@ program
       const status = pm2Statuses[name] || "UNKNOWN";
       const protocol = inst.useHttps ? "https" : "http";
       const publicUrl = `${protocol}://${inst.domain}`;
+
       console.log(`
         ${chalk.bold(name)}:
           Domain: ${chalk.green(inst.domain)} (${protocol})
@@ -1092,10 +1361,13 @@ program
   .action(async (name) => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     try {
       runCommand(`pm2 start pb-${name}`);
+
       console.log(chalk.green(`Instance pb-${name} started.`));
     } catch (e) {
       console.error(chalk.red(`Failed to start instance pb-${name}. Is it configured?`));
@@ -1108,10 +1380,13 @@ program
   .action(async (name) => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     try {
       runCommand(`pm2 stop pb-${name}`);
+
       console.log(chalk.green(`Instance pb-${name} stopped.`));
     } catch (e) {
       console.error(chalk.red(`Failed to stop instance pb-${name}.`));
@@ -1124,10 +1399,13 @@ program
   .action(async (name) => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     try {
       runCommand(`pm2 restart pb-${name}`);
+
       console.log(chalk.green(`Instance pb-${name} restarted.`));
     } catch (e) {
       console.error(chalk.red(`Failed to restart instance pb-${name}.`));
@@ -1140,24 +1418,85 @@ program
   .action((name) => {
     if (process.geteuid && process.geteuid() !== 0) {
       console.error(chalk.red("You must run this script as root or with sudo."));
+
       process.exit(1);
     }
+
     console.log(chalk.blue(`Displaying logs for pb-${name}. Press Ctrl+C to exit.`));
+
     shell.exec(`pm2 logs pb-${name} --lines 50`);
   });
+
+program
+  .command("audit")
+  .description("Show the audit log of commands executed by this CLI")
+  .action(async () => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+
+      process.exit(1);
+    }
+
+    const auditLogPath = path.join(CONFIG_DIR, "audit.log");
+    if (await fs.pathExists(auditLogPath)) {
+      const auditLog = await fs.readFile(auditLogPath, "utf-8");
+
+      console.log(chalk.blue("Displaying audit log for this CLI:"));
+      console.log(auditLog);
+    } else {
+      console.log(chalk.yellow("No audit log found. The log will be created as you use commands."));
+    }
+  });
+
+async function appendAuditLog(command, details) {
+  const auditLogPath = path.join(CONFIG_DIR, "audit.log");
+  const logEntry = `${new Date().toISOString()} - Command: ${command}; Details: ${details}\n`;
+
+  try {
+    await fs.ensureDir(CONFIG_DIR);
+    await fs.appendFile(auditLogPath, logEntry);
+  } catch (e) {
+    if (completeLogging) {
+      console.log(chalk.red(`Failed to append to audit log: ${e.message}`));
+    }
+  }
+}
+
+program.hook("preAction", async (thisCommand) => {
+  try {
+    await fs.ensureDir(CONFIG_DIR);
+
+    const cliConfig = await getCliConfig();
+    const cachedLatestVersion = await getCachedLatestVersion();
+
+    if (cliConfig.defaultPocketBaseVersion && cachedLatestVersion && cliConfig.defaultPocketBaseVersion !== cachedLatestVersion) {
+      console.log(chalk.yellow(`New version of PocketBase has been released: v${cachedLatestVersion}, use 'pb-manager update-pb' to update it`));
+    }
+
+    await appendAuditLog(thisCommand.name(), process.argv.slice(2).join(" "));
+  } catch (e) {
+    if (completeLogging) {
+      console.log(chalk.red(`Error in preAction hook: ${e.message}`));
+    }
+  }
+});
 
 async function main() {
   if (process.geteuid && process.geteuid() !== 0) {
     console.error(chalk.red("You must run this script as root or with sudo."));
+
     process.exit(1);
   }
+
   const cliConfig = await getCliConfig();
   completeLogging = cliConfig.completeLogging || false;
 
   if (!shell.which("pm2")) {
     console.error(chalk.red("PM2 is not installed or not in PATH. Please install PM2: npm install -g pm2"));
+
     process.exit(1);
   }
+
   if (!shell.which("nginx")) {
     console.warn(chalk.yellow("Nginx is not found. Nginx related commands might fail."));
   }
@@ -1168,8 +1507,10 @@ async function main() {
 
 main().catch((err) => {
   console.error(chalk.red("An unexpected error occurred:"), err.message);
+
   if (err.stack && (completeLogging || process.env.DEBUG)) {
     console.error(err.stack);
   }
+
   process.exit(1);
 });

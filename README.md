@@ -1,12 +1,8 @@
-# PocketBase Manager CLI (`pb-manager`)
+# PocketBase Manager (`pb-manager`)
 
 ## Introduction
 
 `pb-manager` is a command-line interface (CLI) tool designed to simplify the management of multiple PocketBase instances on a single Linux server. It automates setup, configuration, and ongoing maintenance tasks, including process management with PM2, reverse proxying with Nginx, SSL certificate handling with Certbot, secure Nginx configuration, and provides an interactive dashboard for instance monitoring.
-
-### Changelogs
-
-You can see the changelogs [here](https://docs.alphasystem.dev/view/45jq16tb74kd0v6).
 
 ### Why pb-manager?
 
@@ -32,6 +28,9 @@ Running multiple web applications, like PocketBase instances, on one server can 
 - Enforce that all commands are run as root or with `sudo` for maximum reliability.
 - Offer an **interactive dashboard** to view instance status, resource usage, and perform quick actions.
 - Allow you to enable or disable **complete logging** for more or less verbose output.
+- **Audit log**: Records all pb-manager commands executed, with timestamps, for administrative auditing.
+- **DNS validation**: Before finalizing HTTPS configuration, validates that the domain's DNS A/AAAA records point to your server.
+- **PocketBase version notification**: Notifies you when a new PocketBase version is available (with 24h cache), at the top of every command.
 
 ## How It Works
 
@@ -46,6 +45,9 @@ Running multiple web applications, like PocketBase instances, on one server can 
 7. **Certbot:** If HTTPS is enabled for an instance, `pb-manager` can attempt to run Certbot to obtain and install a Let's Encrypt SSL certificate for the specified domain. Certbot will modify the Nginx configuration to enable HTTPS.
 8. **Superuser Creation:** When adding a new instance, `pb-manager` offers to create the initial PocketBase superuser (admin) account via the CLI, or guides you to do it via the web UI.
 9. **Interactive Dashboard:** Uses `blessed` and `blessed-contrib` to render a terminal-based UI for real-time monitoring and management of instances.
+10. **Audit Log:** Every command run through pb-manager is recorded in an audit log (`~/.pb-manager/audit.log`) with timestamp and details.
+11. **DNS Validation:** When adding an instance with HTTPS, pb-manager checks that the domain resolves and points to your server's public IP before proceeding.
+12. **PocketBase Version Notification:** At the start of every command, pb-manager checks (with 24h cache) if a new PocketBase version is available and notifies you.
 
 ## Prerequisites
 
@@ -77,7 +79,7 @@ sudo apt update && sudo apt upgrade -y && sudo apt install -y curl git sudo
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManager-CLI/main/install-pb-manager.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManager/main/install-pb-manager.sh | sudo bash
 ```
 
 ### Manual Installation
@@ -111,6 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManag
 - `~/.pb-manager/ecosystem.config.js`: PM2 ecosystem file.
 - `~/.pb-manager/bin/pocketbase`: The downloaded PocketBase executable.
 - `~/.pb-manager/instances_data/<instance-name>/`: Data directory for each instance (contains `pb_data`, `pb_migrations`, etc.).
+- `~/.pb-manager/audit.log`: Audit log of all pb-manager commands executed.
 
 ## Commands
 
@@ -192,6 +195,7 @@ This interactive command will prompt you for:
 
 **Actions Performed:**
 
+- **DNS Validation:** If HTTPS is enabled, pb-manager will check that the domain resolves and points to your server's public IP before proceeding. If not, the process will abort with an error.
 - Creates a data directory for the instance.
 - Saves the instance configuration.
 - Generates and enables a secure, modern Nginx configuration file (with HTTP/2, security headers, and optional 20MB upload limit).
@@ -283,6 +287,17 @@ This command tails the logs. Press `Ctrl+C` to exit the log view.
 - Runs `<path-to-pocketbase-executable> update`. This command makes the PocketBase binary update itself in place.
 - If the update is successful, it iterates through all managed instances and restarts their PM2 processes.
 
+### `audit`
+
+**Purpose:** Displays the audit log of all pb-manager commands executed.
+
+**Usage:**  
+`sudo pb-manager audit`
+
+**Details:**
+
+- Shows the contents of `~/.pb-manager/audit.log`, which records every command run through pb-manager, with timestamp and details.
+
 ## Superuser (Admin) Account Creation
 
 When you add a new PocketBase instance, `pb-manager` will offer to create the initial superuser (admin) account via the CLI using the following command:
@@ -310,6 +325,18 @@ You can enable or disable **complete logging** via the `configure` command.
 
 - When enabled, all commands and outputs (including shell commands, Nginx reloads, PM2 actions, etc.) are shown.
 - When disabled (default), only concise and essential output is shown.
+
+## Audit Log
+
+Every command run through pb-manager is recorded in `~/.pb-manager/audit.log` with a timestamp and the command details. This helps with administrative auditing and tracking changes.
+
+## PocketBase Version Notification
+
+At the start of every command, pb-manager checks (with a 24-hour cache) if a new PocketBase version is available. If so, a notification is displayed at the top of the command output, reminding you to update.
+
+## DNS Validation
+
+When adding a new instance with HTTPS enabled, pb-manager will check that the domain resolves and that its A or AAAA records point to your server's public IP. If not, the process will abort and you must fix your DNS before proceeding.
 
 ## Potential Issues & Disclaimer
 
