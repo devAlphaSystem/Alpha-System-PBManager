@@ -9,8 +9,6 @@ const chalk = require("chalk");
 const unzipper = require("unzipper");
 const shell = require("shelljs");
 
-const POCKETBASE_VERSION_FALLBACK = "0.28.1";
-
 const CONFIG_DIR = path.join(process.env.HOME, ".pb-manager");
 const CLI_CONFIG_PATH = path.join(CONFIG_DIR, "cli-config.json");
 const INSTANCES_CONFIG_PATH = path.join(CONFIG_DIR, "instances.json");
@@ -22,13 +20,26 @@ const PM2_ECOSYSTEM_FILE = path.join(CONFIG_DIR, "ecosystem.config.js");
 const NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 const NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 
+async function getLatestPocketBaseVersion() {
+  try {
+    const res = await axios.get("https://api.github.com/repos/pocketbase/pocketbase/releases/latest", { headers: { "User-Agent": "pb-manager" } });
+    if (res.data?.tag_name) {
+      return res.data.tag_name.replace(/^v/, "");
+    }
+  } catch (e) {
+    console.error(chalk.red("Failed to fetch latest PocketBase version from GitHub. Using fallback version 0.28.1."));
+  }
+  return "0.28.1";
+}
+
 async function getCliConfig() {
+  const latestVersion = await getLatestPocketBaseVersion();
   if (await fs.pathExists(CLI_CONFIG_PATH)) {
     try {
       const config = await fs.readJson(CLI_CONFIG_PATH);
       return {
         defaultCertbotEmail: null,
-        defaultPocketBaseVersion: POCKETBASE_VERSION_FALLBACK,
+        defaultPocketBaseVersion: latestVersion,
         ...config,
       };
     } catch (e) {
@@ -37,7 +48,7 @@ async function getCliConfig() {
   }
   return {
     defaultCertbotEmail: null,
-    defaultPocketBaseVersion: POCKETBASE_VERSION_FALLBACK,
+    defaultPocketBaseVersion: latestVersion,
   };
 }
 
@@ -70,7 +81,7 @@ async function saveInstancesConfig(config) {
 
 async function downloadPocketBaseIfNotExists(versionOverride = null) {
   const cliConfig = await getCliConfig();
-  const versionToDownload = versionOverride || cliConfig.defaultPocketBaseVersion || POCKETBASE_VERSION_FALLBACK;
+  const versionToDownload = versionOverride || cliConfig.defaultPocketBaseVersion || (await getLatestPocketBaseVersion());
 
   if (!versionOverride && (await fs.pathExists(POCKETBASE_EXEC_PATH))) {
     console.log(chalk.green(`PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Skipping download.`));
@@ -152,67 +163,71 @@ async function reloadPm2(specificInstanceName = null) {
   console.log(chalk.green(specificInstanceName ? `PM2 process pb-${specificInstanceName} restarted and PM2 state saved.` : "PM2 ecosystem reloaded and PM2 state saved."));
 }
 
-async function generateNginxConfig(instanceName, domain, port, useHttps) {
+async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, maxBody20Mb) {
+  const securityHeaders = `
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-XSS-Protection "1; mode=block" always;`;
+  const clientMaxBody = maxBody20Mb ? "client_max_body_size 20M;" : "";
+  const http2 = useHttp2 ? " http2" : "";
   let configContent;
   if (useHttps) {
     configContent = `
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
+      server {
+        if ($host = ${domain}) {
+          return 301 https://$host$request_uri;
+        }
+        listen 80;
+        listen [::]:80;
+        server_name ${domain};
+        return 404;
+      }
 
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${domain};
-
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparam.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_buffering off;
-        proxy_read_timeout 300s;
-    }
-}`;
+      server {
+        server_name ${domain};
+        ${securityHeaders}
+        location / {
+          ${clientMaxBody}
+          proxy_pass http://127.0.0.1:${port};
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection 'upgrade';
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_cache_bypass $http_upgrade;
+        }
+        listen 443 ssl${http2};
+        listen [::]:443 ssl${http2};
+        ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+        include /etc/letsencrypt/options-ssl-nginx.conf;
+        ssl_dhparam /etc/letsencrypt/ssl-dhparam.pem;
+      }
+    `;
   } else {
     configContent = `
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-
-    location / {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_buffering off;
-        proxy_read_timeout 300s;
-    }
-}`;
+      server {
+        server_name ${domain};
+        ${securityHeaders}
+        location / {
+          ${clientMaxBody}
+          proxy_pass http://127.0.0.1:${port};
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection 'upgrade';
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_cache_bypass $http_upgrade;
+        }
+        listen 80${http2};
+        listen [::]:80${http2};
+      }
+    `;
   }
 
   const nginxConfPath = path.join(NGINX_SITES_AVAILABLE, instanceName);
@@ -304,7 +319,7 @@ program
             validate: (input) => (/^(\d+\.\d+\.\d+)$/.test(input) || input === "" ? true : "Please enter a valid version (x.y.z) or leave blank."),
           },
         ]);
-        cliConfig.defaultPocketBaseVersion = version || POCKETBASE_VERSION_FALLBACK;
+        cliConfig.defaultPocketBaseVersion = version || (await getLatestPocketBaseVersion());
         await saveCliConfig(cliConfig);
         console.log(chalk.green("Default PocketBase version updated."));
         break;
@@ -324,6 +339,10 @@ program
   .description("Initial setup: creates directories and downloads PocketBase.")
   .option("-v, --version <version>", "Specify PocketBase version to download for setup")
   .action(async (options) => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
     console.log(chalk.bold.cyan("Starting PocketBase Manager Setup..."));
     await ensureBaseSetup();
     await downloadPocketBaseIfNotExists(options.version);
@@ -334,6 +353,10 @@ program
   .command("add")
   .description("Add a new PocketBase instance")
   .action(async () => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
     await ensureBaseSetup();
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       console.log(chalk.yellow("PocketBase executable not found. Running setup..."));
@@ -363,6 +386,18 @@ program
         message: "Internal port for this instance (e.g., 8091):",
         default: 8090 + Math.floor(Math.random() * 100),
         validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port."),
+      },
+      {
+        type: "confirm",
+        name: "useHttp2",
+        message: "Enable HTTP/2 in Nginx config?",
+        default: true,
+      },
+      {
+        type: "confirm",
+        name: "maxBody20Mb",
+        message: "Set 20Mb max body size (client_max_body_size 20M) in Nginx config?",
+        default: true,
       },
     ]);
 
@@ -432,12 +467,14 @@ program
       dataDir: instanceDataDir,
       useHttps: httpsAnswers.useHttps,
       emailForCertbot: httpsAnswers.useHttps ? emailToUseForCertbot : null,
+      useHttp2: initialAnswers.useHttp2,
+      maxBody20Mb: initialAnswers.maxBody20Mb,
     };
 
     await saveInstancesConfig(config);
     console.log(chalk.green(`Instance "${initialAnswers.name}" configuration saved.`));
 
-    await generateNginxConfig(initialAnswers.name, initialAnswers.domain, initialAnswers.port, httpsAnswers.useHttps);
+    await generateNginxConfig(initialAnswers.name, initialAnswers.domain, initialAnswers.port, httpsAnswers.useHttps, initialAnswers.useHttp2, initialAnswers.maxBody20Mb);
     await reloadNginx();
 
     let certbotSuccess = false;
@@ -524,6 +561,10 @@ program
   .command("update-pb")
   .description("Updates the PocketBase executable using 'pocketbase update' and restarts all instances.")
   .action(async () => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
     console.log(chalk.bold.cyan("Attempting to update PocketBase executable..."));
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       console.error(chalk.red("PocketBase executable not found. Run 'setup' or 'configure' to set a version and download."));
@@ -568,6 +609,10 @@ program
   .command("remove <name>")
   .description("Remove a PocketBase instance")
   .action(async (name) => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
     const config = await getInstancesConfig();
     if (!config.instances[name]) {
       console.error(chalk.red(`Instance "${name}" not found.`));
@@ -674,6 +719,10 @@ program
   .command("start <name>")
   .description("Start a specific PocketBase instance via PM2")
   .action(async (name) => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
     try {
       runCommand(`pm2 start pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} started.`));
@@ -686,6 +735,10 @@ program
   .command("stop <name>")
   .description("Stop a specific PocketBase instance via PM2")
   .action(async (name) => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
     try {
       runCommand(`pm2 stop pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} stopped.`));
@@ -698,6 +751,10 @@ program
   .command("restart <name>")
   .description("Restart a specific PocketBase instance via PM2")
   .action(async (name) => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
     try {
       runCommand(`pm2 restart pb-${name}`);
       console.log(chalk.green(`Instance pb-${name} restarted.`));
@@ -710,15 +767,18 @@ program
   .command("logs <name>")
   .description("Show logs for a specific PocketBase instance from PM2")
   .action((name) => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
     console.log(chalk.blue(`Displaying logs for pb-${name}. Press Ctrl+C to exit.`));
     shell.exec(`pm2 logs pb-${name} --lines 50`, { async: false });
   });
 
 async function main() {
-  if (process.argv.some((arg) => ["add", "remove", "update-pb"].includes(arg))) {
-    if (process.geteuid && process.geteuid() !== 0 && !shell.which("sudo")) {
-      console.warn(chalk.yellow("Some operations require sudo. Please run with sudo or ensure Nginx/Certbot commands can be run passwordlessly."));
-    }
+  if (process.geteuid && process.geteuid() !== 0) {
+    console.error(chalk.red("You must run this script as root or with sudo."));
+    process.exit(1);
   }
   if (!shell.which("pm2")) {
     console.error(chalk.red("PM2 is not installed or not in PATH. Please install PM2: npm install -g pm2"));
