@@ -86,11 +86,7 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
   console.log(chalk.blue(`Downloading PocketBase v${versionToDownload} from ${downloadUrl}...`));
 
   try {
-    const response = await axios({
-      url: downloadUrl,
-      method: "GET",
-      responseType: "stream",
-    });
+    const response = await axios({ url: downloadUrl, method: "GET", responseType: "stream" });
     const zipPath = path.join(POCKETBASE_BIN_DIR, "pocketbase.zip");
     const writer = fs.createWriteStream(zipPath);
     response.data.pipe(writer);
@@ -139,9 +135,7 @@ async function updatePm2EcosystemFile() {
     autorestart: true,
     watch: false,
     max_memory_restart: "200M",
-    env: {
-      NODE_ENV: "production",
-    },
+    env: { NODE_ENV: "production" },
   }));
   const ecosystemContent = `module.exports = { apps: ${JSON.stringify(apps, null, 2)} };`;
   await fs.writeFile(PM2_ECOSYSTEM_FILE, ecosystemContent);
@@ -184,7 +178,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
     include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparam.pem;
 
     location / {
         proxy_pass http://127.0.0.1:${port};
@@ -256,9 +250,7 @@ async function runCertbot(domain, email) {
   console.log(chalk.blue(`Attempting to obtain SSL certificate for ${domain} using Certbot...`));
   try {
     runCommand("sudo mkdir -p /var/www/html", "Creating /var/www/html for Certbot", true);
-  } catch (e) {
-    /* ignore */
-  }
+  } catch (e) {}
 
   const certbotCommand = `sudo certbot --nginx -d ${domain} --non-interactive --agree-tos -m "${email}" --redirect`;
   try {
@@ -283,19 +275,7 @@ program
         type: "list",
         name: "action",
         message: "CLI Configuration:",
-        choices: [
-          {
-            name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`,
-            value: "setEmail",
-          },
-          {
-            name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`,
-            value: "setPbVersion",
-          },
-          new inquirer.Separator(),
-          { name: "View current JSON config", value: "viewConfig" },
-          { name: "Exit", value: "exit" },
-        ],
+        choices: [{ name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`, value: "setEmail" }, { name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`, value: "setPbVersion" }, new inquirer.Separator(), { name: "View current JSON config", value: "viewConfig" }, { name: "Exit", value: "exit" }],
       },
     ]);
 
@@ -471,13 +451,73 @@ program
     await updatePm2EcosystemFile();
     await reloadPm2();
 
-    console.log(chalk.bold.green(`Instance "${initialAnswers.name}" added and started!`));
-    const protocol = httpsAnswers.useHttps && certbotSuccess ? "https" : "http";
-    console.log(chalk.blue(`Access it at: ${protocol}://${initialAnswers.domain}`));
-    console.log(chalk.blue(`Admin UI (via internal port, if not firewalled): http://127.0.0.1:${initialAnswers.port}/_/`));
-    if (httpsAnswers.useHttps && !certbotSuccess && httpsAnswers.autoRunCertbot) {
-      console.log(chalk.red("Certbot failed. The instance might only be available via HTTP or not at all if Nginx config expects SSL."));
+    let adminCreatedViaCli = false;
+
+    const { createAdminCli } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "createAdminCli",
+        message: "Do you want to create a superuser (admin) account for this instance via CLI now?",
+        default: true,
+      },
+    ]);
+
+    if (createAdminCli) {
+      const adminCredentials = await inquirer.prompt([
+        {
+          type: "input",
+          name: "adminEmail",
+          message: "Enter admin email:",
+          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+        },
+        {
+          type: "password",
+          name: "adminPassword",
+          message: "Enter admin password (min 8 chars):",
+          mask: "*",
+          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+        },
+      ]);
+
+      const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${instanceDataDir}"`;
+      console.log(chalk.blue("\nAttempting to create superuser (admin) account via CLI..."));
+
+      try {
+        runCommand(adminCreateCommand, "Failed to create superuser (admin) account via CLI.");
+        console.log(chalk.green(`Superuser (admin) account for ${adminCredentials.adminEmail} created successfully!`));
+        adminCreatedViaCli = true;
+      } catch (e) {
+        console.error(chalk.red("Superuser (admin) account creation via CLI failed. Please try creating it via the web UI."));
+      }
     }
+
+    console.log(chalk.bold.green(`\nInstance "${initialAnswers.name}" added and started!`));
+
+    const protocol = httpsAnswers.useHttps && certbotSuccess ? "https" : "http";
+    const publicBaseUrl = `${protocol}://${initialAnswers.domain}`;
+    const localAdminUrl = `http://127.0.0.1:${initialAnswers.port}/_/`;
+
+    console.log(chalk.blue("\nInstance Details:"));
+    console.log(chalk.blue(`  Public URL: ${publicBaseUrl}`));
+
+    if (!adminCreatedViaCli) {
+      console.log(chalk.yellow("\nIMPORTANT NEXT STEP: Create your PocketBase Admin Account"));
+      console.log(chalk.yellow("1. Visit one of the URLs below in your browser to create the first admin user:"));
+      console.log(chalk.yellow(`   - Option A (Recommended if Nginx/HTTPS is working): ${publicBaseUrl}_/`));
+      console.log(chalk.yellow(`   - Option B (Direct access, may require SSH port forwarding for headless servers): ${localAdminUrl}`));
+      console.log(chalk.cyan(`     (For SSH port forwarding: ssh -L ${initialAnswers.port}:127.0.0.1:${initialAnswers.port} your_user@your_server_ip then open ${localAdminUrl} in your local browser)`));
+    } else {
+      console.log(chalk.yellow("\nYou can now access the admin panel at:"));
+      console.log(chalk.yellow(`   - ${publicBaseUrl}_/`));
+      console.log(chalk.yellow(`   - Or locally (if needed for direct access): ${localAdminUrl}`));
+    }
+
+    if (httpsAnswers.useHttps && !certbotSuccess && httpsAnswers.autoRunCertbot) {
+      console.log(chalk.red("\nCertbot failed. The instance might only be available via HTTP or not at all if Nginx config expects SSL."));
+      console.log(chalk.red("You might need to use the local URL for admin access or fix the Nginx/Certbot issue."));
+    }
+
+    console.log(chalk.yellow("\nOnce logged in, you can manage your collections and settings."));
   });
 
 program
@@ -582,9 +622,7 @@ program
     await updatePm2EcosystemFile();
     try {
       runCommand("pm2 save");
-    } catch (e) {
-      /* ignore */
-    }
+    } catch (e) {}
 
     await reloadNginx();
 
