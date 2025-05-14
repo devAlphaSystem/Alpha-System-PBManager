@@ -46,23 +46,14 @@ async function getCliConfig() {
   if (await fs.pathExists(CLI_CONFIG_PATH)) {
     try {
       const config = await fs.readJson(CLI_CONFIG_PATH);
-      return {
-        defaultCertbotEmail: null,
-        defaultPocketBaseVersion: latestVersion,
-        completeLogging: false,
-        ...config,
-      };
+      return Object.assign({ defaultCertbotEmail: null, defaultPocketBaseVersion: latestVersion, completeLogging: false }, config);
     } catch (e) {
       if (completeLogging) {
         console.warn(chalk.yellow("Could not read CLI config, using defaults."));
       }
     }
   }
-  return {
-    defaultCertbotEmail: null,
-    defaultPocketBaseVersion: latestVersion,
-    completeLogging: false,
-  };
+  return { defaultCertbotEmail: null, defaultPocketBaseVersion: latestVersion, completeLogging: false };
 }
 
 async function saveCliConfig(config) {
@@ -166,16 +157,20 @@ function runCommand(command, errorMessage, ignoreError = false) {
 
 async function updatePm2EcosystemFile() {
   const config = await getInstancesConfig();
-  const apps = Object.values(config.instances).map((inst) => ({
-    name: `pb-${inst.name}`,
-    script: POCKETBASE_EXEC_PATH,
-    args: `serve --http "127.0.0.1:${inst.port}" --dir "${inst.dataDir}"`,
-    cwd: POCKETBASE_BIN_DIR,
-    autorestart: true,
-    watch: false,
-    max_memory_restart: "200M",
-    env: { NODE_ENV: "production" },
-  }));
+  const apps = [];
+  for (const instName in config.instances) {
+    const inst = config.instances[instName];
+    apps.push({
+      name: `pb-${inst.name}`,
+      script: POCKETBASE_EXEC_PATH,
+      args: `serve --http "127.0.0.1:${inst.port}" --dir "${inst.dataDir}"`,
+      cwd: POCKETBASE_BIN_DIR,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "200M",
+      env: { NODE_ENV: "production" },
+    });
+  }
   const ecosystemContent = `module.exports = { apps: ${JSON.stringify(apps, null, 2)} };`;
   await fs.writeFile(PM2_ECOSYSTEM_FILE, ecosystemContent);
   console.log(chalk.green("PM2 ecosystem file updated."));
@@ -293,6 +288,28 @@ async function reloadNginx() {
   }
 }
 
+async function ensureDhParamExists() {
+  const dhParamPath = "/etc/letsencrypt/ssl-dhparam.pem";
+  if (!(await fs.pathExists(dhParamPath))) {
+    if (completeLogging) {
+      console.log(chalk.yellow(`${dhParamPath} not found. Generating... This may take a few minutes.`));
+    }
+    try {
+      await fs.ensureDir("/etc/letsencrypt");
+      runCommand(`sudo openssl dhparam -out ${dhParamPath} 2048`, `Failed to generate ${dhParamPath}. Nginx might fail to reload.`);
+      if (completeLogging) {
+        console.log(chalk.green(`${dhParamPath} generated successfully.`));
+      }
+    } catch (error) {
+      console.error(chalk.red(`Error generating ${dhParamPath}: ${error.message}`));
+    }
+  } else {
+    if (completeLogging) {
+      console.log(chalk.green(`${dhParamPath} already exists.`));
+    }
+  }
+}
+
 async function runCertbot(domain, email) {
   if (!shell.which("certbot")) {
     console.error(chalk.red("Certbot command not found. Please install Certbot first."));
@@ -327,7 +344,13 @@ async function getInstanceUsageAnalytics(instances) {
   const usage = [];
   for (const name in instances) {
     const inst = instances[name];
-    const pm2Proc = pm2List.find((proc) => proc.name === `pb-${name}`);
+    let pm2Proc;
+    for (const i in pm2List) {
+      if (pm2List[i].name === `pb-${name}`) {
+        pm2Proc = pm2List[i];
+        break;
+      }
+    }
     const status = pm2Proc ? pm2Proc.pm2_env.status : "offline";
     const cpu = pm2Proc?.monit ? pm2Proc.monit.cpu : 0;
     const mem = pm2Proc?.monit ? pm2Proc.monit.memory : 0;
@@ -398,24 +421,8 @@ async function showDashboard() {
   }
   const screen = blessed.screen({ smartCSR: true, title: "PocketBase Manager Dashboard" });
   const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
-  const table = grid.set(0, 0, 10, 12, contrib.table, {
-    keys: true,
-    fg: "white",
-    selectedFg: "white",
-    selectedBg: "blue",
-    interactive: true,
-    label: "PocketBase Instances",
-    width: "100%",
-    height: "100%",
-    border: { type: "line", fg: "cyan" },
-    columnSpacing: 2,
-    columnWidth: [12, 24, 7, 10, 8, 10, 10, 8, 8, 8],
-  });
-  const help = grid.set(10, 0, 2, 12, blessed.box, {
-    content: " [q] Quit  [r] Refresh  [l] Logs  [s] Start/Stop  [d] Delete",
-    tags: true,
-    style: { fg: "yellow" },
-  });
+  const table = grid.set(0, 0, 10, 12, contrib.table, { keys: true, fg: "white", selectedFg: "white", selectedBg: "blue", interactive: true, label: "PocketBase Instances", width: "100%", height: "100%", border: { type: "line", fg: "cyan" }, columnSpacing: 2, columnWidth: [12, 24, 7, 10, 8, 10, 10, 8, 8, 8] });
+  const help = grid.set(10, 0, 2, 12, blessed.box, { content: " [q] Quit  [r] Refresh  [l] Logs  [s] Start/Stop  [d] Delete", tags: true, style: { fg: "yellow" } });
 
   let currentData = [];
   let selectedIndex = 0;
@@ -427,10 +434,7 @@ async function showDashboard() {
     for (const u of usage) {
       data.push([u.name, u.domain, u.port, u.status, u.httpStatus, u.ssl, `${u.cpu}%`, prettyBytes(u.mem), formatUptime(u.uptime), prettyBytes(u.dataSize)]);
     }
-    table.setData({
-      headers: ["Name", "Domain", "Port", "Status", "HTTP", "SSL", "CPU", "Mem", "Uptime", "Data"],
-      data,
-    });
+    table.setData({ headers: ["Name", "Domain", "Port", "Status", "HTTP", "SSL", "CPU", "Mem", "Uptime", "Data"], data });
     if (data.length > 0) {
       if (selectedIndex >= data.length) selectedIndex = data.length - 1;
       table.rows.select(selectedIndex);
@@ -515,54 +519,25 @@ program
     const cliConfig = await getCliConfig();
     completeLogging = cliConfig.completeLogging || false;
 
-    const { action } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "action",
-        message: "CLI Configuration:",
-        choices: [{ name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`, value: "setEmail" }, { name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`, value: "setPbVersion" }, { name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`, value: "setLogging" }, new inquirer.Separator(), { name: "View current JSON config", value: "viewConfig" }, { name: "Exit", value: "exit" }],
-      },
-    ]);
+    const { action } = await inquirer.prompt([{ type: "list", name: "action", message: "CLI Configuration:", choices: [{ name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`, value: "setEmail" }, { name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`, value: "setPbVersion" }, { name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`, value: "setLogging" }, new inquirer.Separator(), { name: "View current JSON config", value: "viewConfig" }, { name: "Exit", value: "exit" }] }]);
 
     switch (action) {
       case "setEmail": {
-        const { email } = await inquirer.prompt([
-          {
-            type: "input",
-            name: "email",
-            message: "Enter new default Certbot email (leave blank to clear):",
-            default: cliConfig.defaultCertbotEmail,
-          },
-        ]);
+        const { email } = await inquirer.prompt([{ type: "input", name: "email", message: "Enter new default Certbot email (leave blank to clear):", default: cliConfig.defaultCertbotEmail }]);
         cliConfig.defaultCertbotEmail = email || null;
         await saveCliConfig(cliConfig);
         console.log(chalk.green("Default Certbot email updated."));
         break;
       }
       case "setPbVersion": {
-        const { version } = await inquirer.prompt([
-          {
-            type: "input",
-            name: "version",
-            message: "Enter new default PocketBase version (e.g., 0.22.10):",
-            default: cliConfig.defaultPocketBaseVersion,
-            validate: (input) => (/^(\d+\.\d+\.\d+)$/.test(input) || input === "" ? true : "Please enter a valid version (x.y.z) or leave blank."),
-          },
-        ]);
+        const { version } = await inquirer.prompt([{ type: "input", name: "version", message: "Enter new default PocketBase version (e.g., 0.22.10):", default: cliConfig.defaultPocketBaseVersion, validate: (input) => (/^(\d+\.\d+\.\d+)$/.test(input) || input === "" ? true : "Please enter a valid version (x.y.z) or leave blank.") }]);
         cliConfig.defaultPocketBaseVersion = version || (await getLatestPocketBaseVersion());
         await saveCliConfig(cliConfig);
         console.log(chalk.green("Default PocketBase version updated."));
         break;
       }
       case "setLogging": {
-        const { enableLogging } = await inquirer.prompt([
-          {
-            type: "confirm",
-            name: "enableLogging",
-            message: "Enable complete logging (show all commands and outputs)?",
-            default: cliConfig.completeLogging || false,
-          },
-        ]);
+        const { enableLogging } = await inquirer.prompt([{ type: "confirm", name: "enableLogging", message: "Enable complete logging (show all commands and outputs)?", default: cliConfig.completeLogging || false }]);
         cliConfig.completeLogging = enableLogging;
         await saveCliConfig(cliConfig);
         completeLogging = enableLogging;
@@ -619,37 +594,11 @@ program
     }
 
     const initialAnswers = await inquirer.prompt([
-      {
-        type: "input",
-        name: "name",
-        message: "Instance name (e.g., my-app, no spaces):",
-        validate: (input) => (/^[a-zA-Z0-9-]+$/.test(input) ? true : "Invalid name format."),
-      },
-      {
-        type: "input",
-        name: "domain",
-        message: "Domain/subdomain for this instance (e.g., app.example.com):",
-        validate: (input) => (input.length > 0 ? true : "Domain cannot be empty."),
-      },
-      {
-        type: "number",
-        name: "port",
-        message: "Internal port for this instance (e.g., 8091):",
-        default: 8090 + Math.floor(Math.random() * 100),
-        validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port."),
-      },
-      {
-        type: "confirm",
-        name: "useHttp2",
-        message: "Enable HTTP/2 in Nginx config?",
-        default: true,
-      },
-      {
-        type: "confirm",
-        name: "maxBody20Mb",
-        message: "Set 20Mb max body size (client_max_body_size 20M) in Nginx config?",
-        default: true,
-      },
+      { type: "input", name: "name", message: "Instance name (e.g., my-app, no spaces):", validate: (input) => (/^[a-zA-Z0-9-]+$/.test(input) ? true : "Invalid name format.") },
+      { type: "input", name: "domain", message: "Domain/subdomain for this instance (e.g., app.example.com):", validate: (input) => (input.length > 0 ? true : "Domain cannot be empty.") },
+      { type: "number", name: "port", message: "Internal port for this instance (e.g., 8091):", default: 8090 + Math.floor(Math.random() * 100), validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port.") },
+      { type: "confirm", name: "useHttp2", message: "Enable HTTP/2 in Nginx config?", default: true },
+      { type: "confirm", name: "maxBody20Mb", message: "Set 20Mb max body size (client_max_body_size 20M) in Nginx config?", default: true },
     ]);
 
     const config = await getInstancesConfig();
@@ -657,42 +606,20 @@ program
       console.error(chalk.red(`Instance "${initialAnswers.name}" already exists.`));
       return;
     }
-    if (Object.values(config.instances).some((inst) => inst.port === initialAnswers.port)) {
-      console.error(chalk.red(`Port ${initialAnswers.port} is already in use by another managed instance.`));
-      return;
+    for (const instName in config.instances) {
+      if (config.instances[instName].port === initialAnswers.port) {
+        console.error(chalk.red(`Port ${initialAnswers.port} is already in use by another managed instance.`));
+        return;
+      }
     }
 
     let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
 
     const httpsAnswers = await inquirer.prompt([
-      {
-        type: "confirm",
-        name: "useHttps",
-        message: "Configure HTTPS (Certbot)?",
-        default: true,
-      },
-      {
-        type: "confirm",
-        name: "useDefaultEmail",
-        message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`,
-        default: true,
-        when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail,
-      },
-      {
-        type: "input",
-        name: "emailForCertbot",
-        message: "Enter email for Let's Encrypt:",
-        when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail),
-        validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."),
-        default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConfig.defaultCertbotEmail),
-      },
-      {
-        type: "confirm",
-        name: "autoRunCertbot",
-        message: "Attempt to automatically run Certbot now to obtain the SSL certificate?",
-        default: true,
-        when: (answers) => answers.useHttps,
-      },
+      { type: "confirm", name: "useHttps", message: "Configure HTTPS (Certbot)?", default: true },
+      { type: "confirm", name: "useDefaultEmail", message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`, default: true, when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail },
+      { type: "input", name: "emailForCertbot", message: "Enter email for Let's Encrypt:", when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail), validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."), default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConfig.defaultCertbotEmail) },
+      { type: "confirm", name: "autoRunCertbot", message: "Attempt to automatically run Certbot now to obtain the SSL certificate?", default: true, when: (answers) => answers.useHttps },
     ]);
 
     if (httpsAnswers.useHttps) {
@@ -724,48 +651,45 @@ program
     await saveInstancesConfig(config);
     console.log(chalk.green(`Instance "${initialAnswers.name}" configuration saved.`));
 
-    await generateNginxConfig(initialAnswers.name, initialAnswers.domain, initialAnswers.port, httpsAnswers.useHttps, initialAnswers.useHttp2, initialAnswers.maxBody20Mb);
-    await reloadNginx();
-
     let certbotSuccess = false;
-    if (httpsAnswers.useHttps && httpsAnswers.autoRunCertbot) {
-      certbotSuccess = await runCertbot(initialAnswers.domain, emailToUseForCertbot);
-    } else if (httpsAnswers.useHttps && !httpsAnswers.autoRunCertbot) {
-      if (completeLogging) {
-        console.log(chalk.yellow("Skipping automatic Certbot execution."));
+    const nginxConfigParams = {
+      instanceName: initialAnswers.name,
+      domain: initialAnswers.domain,
+      port: initialAnswers.port,
+      useHttp2: initialAnswers.useHttp2,
+      maxBody20Mb: initialAnswers.maxBody20Mb,
+    };
+    if (httpsAnswers.useHttps) {
+      await ensureDhParamExists();
+      if (httpsAnswers.autoRunCertbot) {
+        await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, false, nginxConfigParams.maxBody20Mb);
+        await reloadNginx();
+        certbotSuccess = await runCertbot(initialAnswers.domain, emailToUseForCertbot);
+        if (certbotSuccess) {
+          await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
+        } else {
+          await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
+        }
+      } else {
+        await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
         console.log(chalk.yellow(`To obtain a certificate later, you can try running: sudo certbot --nginx -d ${initialAnswers.domain} -m ${emailToUseForCertbot}`));
       }
+    } else {
+      await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
     }
 
+    await reloadNginx();
     await updatePm2EcosystemFile();
     await reloadPm2();
 
     let adminCreatedViaCli = false;
 
-    const { createAdminCli } = await inquirer.prompt([
-      {
-        type: "confirm",
-        name: "createAdminCli",
-        message: "Do you want to create a superuser (admin) account for this instance via CLI now?",
-        default: true,
-      },
-    ]);
+    const { createAdminCli } = await inquirer.prompt([{ type: "confirm", name: "createAdminCli", message: "Do you want to create a superuser (admin) account for this instance via CLI now?", default: true }]);
 
     if (createAdminCli) {
       const adminCredentials = await inquirer.prompt([
-        {
-          type: "input",
-          name: "adminEmail",
-          message: "Enter admin email:",
-          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
-        },
-        {
-          type: "password",
-          name: "adminPassword",
-          message: "Enter admin password (min 8 chars):",
-          mask: "*",
-          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
-        },
+        { type: "input", name: "adminEmail", message: "Enter admin email:", validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email.") },
+        { type: "password", name: "adminPassword", message: "Enter admin password (min 8 chars):", mask: "*", validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters.") },
       ]);
 
       const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${instanceDataDir}"`;
@@ -792,17 +716,17 @@ program
     const localAdminUrl = `http://127.0.0.1:${initialAnswers.port}/_/`;
 
     console.log(chalk.blue("\nInstance Details:"));
-    console.log(chalk.blue(`  Public URL: ${publicBaseUrl}`));
+    console.log(chalk.blue(`  Public URL: ${publicBaseUrl}/_/`));
 
     if (!adminCreatedViaCli) {
       console.log(chalk.yellow("\nIMPORTANT NEXT STEP: Create your PocketBase Admin Account"));
       console.log(chalk.yellow("1. Visit one of the URLs below in your browser to create the first admin user:"));
-      console.log(chalk.yellow(`   - Option A (Recommended if Nginx/HTTPS is working): ${publicBaseUrl}_/`));
+      console.log(chalk.yellow(`   - Option A (Recommended if Nginx/HTTPS is working): ${publicBaseUrl}/_/`));
       console.log(chalk.yellow(`   - Option B (Direct access, may require SSH port forwarding for headless servers): ${localAdminUrl}`));
       console.log(chalk.cyan(`     (For SSH port forwarding: ssh -L ${initialAnswers.port}:127.0.0.1:${initialAnswers.port} your_user@your_server_ip then open ${localAdminUrl} in your local browser)`));
     } else {
       console.log(chalk.yellow("\nYou can now access the admin panel at:"));
-      console.log(chalk.yellow(`   - ${publicBaseUrl}_/`));
+      console.log(chalk.yellow(`   - ${publicBaseUrl}/_/`));
       console.log(chalk.yellow(`   - Or locally (if needed for direct access): ${localAdminUrl}`));
     }
 
@@ -886,14 +810,7 @@ program
       return;
     }
 
-    const { confirm } = await inquirer.prompt([
-      {
-        type: "confirm",
-        name: "confirm",
-        message: `Are you sure you want to remove instance "${name}"? This will stop it, remove its PM2 entry, and Nginx config. Data directory will NOT be deleted automatically.`,
-        default: false,
-      },
-    ]);
+    const { confirm } = await inquirer.prompt([{ type: "confirm", name: "confirm", message: `Are you sure you want to remove instance "${name}"? This will stop it, remove its PM2 entry, and Nginx config. Data directory will NOT be deleted automatically.`, default: false }]);
 
     if (!confirm) {
       console.log(chalk.yellow("Removal cancelled."));
@@ -985,13 +902,15 @@ program
       const inst = config.instances[name];
       const status = pm2Statuses[name] || "UNKNOWN";
       const protocol = inst.useHttps ? "https" : "http";
+      const publicUrl = `${protocol}://${inst.domain}`;
       console.log(`
-  ${chalk.bold(name)}:
-    Domain: ${chalk.green(inst.domain)} (${protocol})
-    Internal Port: ${chalk.yellow(inst.port)}
-    Data Directory: ${inst.dataDir}
-    PM2 Status: ${status === "online" ? chalk.green(status) : chalk.red(status)}
-    Admin URL (local): http://127.0.0.1:${inst.port}/_/
+        ${chalk.bold(name)}:
+          Domain: ${chalk.green(inst.domain)} (${protocol})
+          Public URL: ${chalk.green(publicUrl)}/_/
+          Internal Port: ${chalk.yellow(inst.port)}
+          Data Directory: ${inst.dataDir}
+          PM2 Status: ${status === "online" ? chalk.green(status) : chalk.red(status)}
+          Admin URL (local): http://127.0.0.1:${inst.port}/_/
       `);
     }
   });
