@@ -299,12 +299,13 @@ async function updatePm2EcosystemFile() {
 
   for (const instName in config.instances) {
     const inst = config.instances[instName];
+    const migrationsDir = path.join(inst.dataDir, "pb_migrations");
 
     apps.push({
       name: `pb-${inst.name}`,
       script: POCKETBASE_EXEC_PATH,
-      args: `serve --http "127.0.0.1:${inst.port}" --dir "${inst.dataDir}"`,
-      cwd: POCKETBASE_BIN_DIR,
+      args: `serve --http "127.0.0.1:${inst.port}" --dir "${inst.dataDir}" --migrationsDir "${migrationsDir}"`,
+      cwd: inst.dataDir,
       autorestart: true,
       watch: false,
       max_memory_restart: "200M",
@@ -1093,7 +1094,8 @@ program
         },
       ]);
 
-      const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${instanceDataDir}"`;
+      const migrationsDir = path.join(instanceDataDir, "pb_migrations");
+      const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${instanceDataDir}" --migrationsDir "${migrationsDir}"`;
 
       if (completeLogging) {
         console.log(chalk.blue("\nAttempting to create superuser (admin) account via CLI..."));
@@ -1446,6 +1448,22 @@ program
     } else {
       console.log(chalk.yellow("No audit log found. The log will be created as you use commands."));
     }
+  });
+
+program
+  .command("update-ecosystem")
+  .description("Regenerate the PM2 ecosystem file and reload PM2")
+  .action(async () => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+
+      process.exit(1);
+    }
+
+    await updatePm2EcosystemFile();
+    await reloadPm2();
+
+    console.log(chalk.green("PM2 ecosystem file updated and PM2 reloaded."));
   });
 
 async function appendAuditLog(command, details) {
