@@ -601,6 +601,46 @@ function formatUptime(ms) {
   return `${d}d ${h % 24}h`;
 }
 
+async function getCertExpiryDays(domain) {
+  return new Promise((resolve) => {
+    const tls = require("node:tls");
+    const options = {
+      host: domain,
+      port: 443,
+      servername: domain,
+      rejectUnauthorized: false,
+      timeout: 5000,
+    };
+
+    const socket = tls.connect(options, () => {
+      const cert = socket.getPeerCertificate();
+
+      socket.end();
+
+      if (!cert || !cert.valid_to) {
+        resolve("-");
+      } else {
+        const expiryDate = new Date(cert.valid_to);
+        const now = new Date();
+        const diff = expiryDate.getTime() - now.getTime();
+        const daysLeft = Math.ceil(diff / (1000 * 60 * 60 * 24));
+
+        resolve(daysLeft);
+      }
+    });
+
+    socket.on("error", () => {
+      resolve("-");
+    });
+
+    socket.setTimeout(5000, () => {
+      socket.destroy();
+
+      resolve("-");
+    });
+  });
+}
+
 async function showDashboard() {
   await ensureBaseSetup();
 
@@ -629,7 +669,7 @@ async function showDashboard() {
     height: "100%",
     border: { type: "line", fg: "cyan" },
     columnSpacing: 2,
-    columnWidth: [12, 24, 7, 10, 8, 10, 10, 8, 8, 8],
+    columnWidth: [25, 25, 8, 10, 8, 10, 10, 8, 8, 8],
   });
 
   const help = grid.set(10, 0, 2, 12, blessed.box, {
@@ -637,6 +677,10 @@ async function showDashboard() {
     tags: true,
     style: { fg: "yellow" },
   });
+
+  function truncateText(text, maxLength) {
+    return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+  }
 
   let currentData = [];
   let selectedIndex = 0;
@@ -648,7 +692,7 @@ async function showDashboard() {
     const data = [];
 
     for (const u of usage) {
-      data.push([u.name, u.domain, u.port, u.status, u.httpStatus, u.ssl, `${u.cpu}%`, prettyBytes(u.mem), formatUptime(u.uptime), prettyBytes(u.dataSize)]);
+      data.push([truncateText(u.name, 25), truncateText(u.domain, 25), u.port, u.status, u.httpStatus, u.ssl, `${u.cpu}%`, prettyBytes(u.mem), formatUptime(u.uptime), prettyBytes(u.dataSize)]);
     }
 
     table.setData({
@@ -1311,10 +1355,63 @@ program
 program
   .command("list")
   .description("List all managed PocketBase instances")
-  .action(async () => {
+  .option("--json", "Output in JSON format")
+  .action(async (options) => {
     const config = await getInstancesConfig();
     if (Object.keys(config.instances).length === 0) {
-      console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
+      if (options.json) {
+        console.log(JSON.stringify([], null, 2));
+      } else {
+        console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
+      }
+
+      return;
+    }
+
+    if (options.json) {
+      const pm2Statuses = {};
+
+      try {
+        const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
+        if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
+          const pm2List = JSON.parse(pm2ListRaw.stdout);
+          for (const proc of pm2List) {
+            if (proc.name.startsWith("pb-")) {
+              pm2Statuses[proc.name.substring(3)] = proc.pm2_env.status;
+            }
+          }
+        }
+      } catch (e) {}
+
+      const output = [];
+      for (const name in config.instances) {
+        const inst = config.instances[name];
+
+        let certExpiry = "-";
+
+        if (inst.useHttps) {
+          certExpiry = await getCertExpiryDays(inst.domain);
+        }
+
+        const status = pm2Statuses[name] || "UNKNOWN";
+        const protocol = inst.useHttps ? "https" : "http";
+        const publicUrl = `${protocol}://${inst.domain}`;
+
+        output.push({
+          name,
+          domain: inst.domain,
+          protocol,
+          publicUrl: `${publicUrl}/_/`,
+          internalPort: inst.port,
+          dataDirectory: inst.dataDir,
+          pm2Status: status,
+          adminURL: `http://127.0.0.1:${inst.port}/_/`,
+          certExpiryDays: certExpiry,
+        });
+      }
+
+      console.log(JSON.stringify(output, null, 2));
+
       return;
     }
 
@@ -1324,7 +1421,6 @@ program
 
     try {
       const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
-
       if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
         const pm2List = JSON.parse(pm2ListRaw.stdout);
         for (const proc of pm2List) {
@@ -1333,14 +1429,17 @@ program
           }
         }
       }
-    } catch (e) {
-      if (completeLogging) {
-        console.warn(chalk.yellow("Could not fetch PM2 statuses. Is PM2 running?"));
-      }
-    }
+    } catch (e) {}
 
     for (const name in config.instances) {
       const inst = config.instances[name];
+
+      let certExpiry = "-";
+
+      if (inst.useHttps) {
+        certExpiry = await getCertExpiryDays(inst.domain);
+      }
+
       const status = pm2Statuses[name] || "UNKNOWN";
       const protocol = inst.useHttps ? "https" : "http";
       const publicUrl = `${protocol}://${inst.domain}`;
@@ -1353,6 +1452,7 @@ program
           Data Directory: ${inst.dataDir}
           PM2 Status: ${status === "online" ? chalk.green(status) : chalk.red(status)}
           Admin URL (local): http://127.0.0.1:${inst.port}/_/
+          Certificate expires in: ${certExpiry} day(s)
       `);
     }
   });
