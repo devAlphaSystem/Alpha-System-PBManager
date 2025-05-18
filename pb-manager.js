@@ -1566,6 +1566,166 @@ program
     console.log(chalk.green("PM2 ecosystem file updated and PM2 reloaded."));
   });
 
+program
+  .command("reset <name>")
+  .description("Reset a PocketBase instance (delete all data and optionally create a new admin account)")
+  .action(async (name) => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
+
+    const config = await getInstancesConfig();
+    if (!config.instances[name]) {
+      console.error(chalk.red(`Instance "${name}" not found.`));
+      return;
+    }
+
+    const instance = config.instances[name];
+    const dataDir = instance.dataDir;
+
+    const { confirm } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirm",
+        message: `Are you sure you want to reset instance "${name}"? This will DELETE ALL DATA in ${dataDir} and start from zero. This cannot be undone.`,
+        default: false,
+      },
+    ]);
+
+    if (!confirm) {
+      console.log(chalk.yellow("Reset cancelled."));
+      return;
+    }
+
+    try {
+      runCommand(`pm2 stop pb-${name}`, `Stopping pb-${name}`, true);
+      runCommand(`pm2 delete pb-${name}`, `Deleting pb-${name}`, true);
+    } catch (e) {}
+
+    if (await fs.pathExists(dataDir)) {
+      try {
+        await fs.remove(dataDir);
+        console.log(chalk.green(`Data directory ${dataDir} deleted.`));
+      } catch (e) {
+        console.error(chalk.red(`Failed to delete data directory: ${e.message}`));
+        return;
+      }
+    }
+
+    await fs.ensureDir(dataDir);
+
+    await updatePm2EcosystemFile();
+    await reloadPm2();
+
+    console.log(chalk.green(`Instance "${name}" has been reset. Data directory is now empty.`));
+
+    const { createAdminCli } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "createAdminCli",
+        message: "Do you want to create a new superuser (admin) account for this instance via CLI now?",
+        default: true,
+      },
+    ]);
+
+    if (createAdminCli) {
+      const adminCredentials = await inquirer.prompt([
+        {
+          type: "input",
+          name: "adminEmail",
+          message: "Enter admin email:",
+          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+        },
+        {
+          type: "password",
+          name: "adminPassword",
+          message: "Enter admin password (min 8 chars):",
+          mask: "*",
+          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+        },
+      ]);
+
+      const migrationsDir = path.join(dataDir, "pb_migrations");
+      const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${dataDir}" --migrationsDir "${migrationsDir}"`;
+
+      if (completeLogging) {
+        console.log(chalk.blue("\nAttempting to create superuser (admin) account via CLI..."));
+        console.log(chalk.yellow(`Executing: ${adminCreateCommand}`));
+      }
+
+      try {
+        const result = runCommand(adminCreateCommand, "Failed to create superuser (admin) account via CLI.");
+
+        if (result?.stdout?.includes("Successfully created new superuser")) {
+          console.log(result.stdout.trim());
+        }
+
+        console.log(chalk.green(`Superuser (admin) account for ${adminCredentials.adminEmail} created successfully!`));
+      } catch (e) {
+        console.error(chalk.red("Superuser (admin) account creation via CLI failed. Please try creating it via the web UI."));
+      }
+    }
+
+    runCommand(`pm2 start pb-${name}`, `Starting pb-${name}`, true);
+
+    console.log(chalk.bold.green(`Instance "${name}" reset and started.`));
+  });
+
+program
+  .command("reset-admin <name>")
+  .description("Reset the admin password for a PocketBase instance")
+  .action(async (name) => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+      process.exit(1);
+    }
+
+    const config = await getInstancesConfig();
+    if (!config.instances[name]) {
+      console.error(chalk.red(`Instance "${name}" not found.`));
+      return;
+    }
+
+    const instance = config.instances[name];
+    const dataDir = instance.dataDir;
+
+    const adminCredentials = await inquirer.prompt([
+      {
+        type: "input",
+        name: "adminEmail",
+        message: "Enter admin email to reset:",
+        validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+      },
+      {
+        type: "password",
+        name: "adminPassword",
+        message: "Enter new admin password (min 8 chars):",
+        mask: "*",
+        validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+      },
+    ]);
+
+    const adminUpdateCommand = `${POCKETBASE_EXEC_PATH} superuser update "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${dataDir}"`;
+
+    if (completeLogging) {
+      console.log(chalk.blue("\nAttempting to reset superuser (admin) password via CLI..."));
+      console.log(chalk.yellow(`Executing: ${adminUpdateCommand}`));
+    }
+
+    try {
+      const result = runCommand(adminUpdateCommand, "Failed to reset superuser (admin) password via CLI.");
+
+      if (result?.stdout?.includes("Successfully updated superuser")) {
+        console.log(result.stdout.trim());
+      }
+
+      console.log(chalk.green(`Superuser (admin) password for ${adminCredentials.adminEmail} reset successfully!`));
+    } catch (e) {
+      console.error(chalk.red("Superuser (admin) password reset via CLI failed. Please try resetting it via the web UI."));
+    }
+  });
+
 async function appendAuditLog(command, details) {
   const auditLogPath = path.join(CONFIG_DIR, "audit.log");
   const logEntry = `${new Date().toISOString()} - Command: ${command}; Details: ${details}\n`;
@@ -1598,6 +1758,41 @@ program.hook("preAction", async (thisCommand) => {
     }
   }
 });
+
+program.helpInformation = () => `
+  PocketBase Manager (pb-manager)
+  A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
+
+  Usage:
+    sudo pb-manager <command> [options]
+
+  Main Commands:
+    dashboard             Show interactive dashboard for all PocketBase instances
+    add                   Add a new PocketBase instance
+    list [--json]         List all managed PocketBase instances
+    remove <name>         Remove a PocketBase instance
+    reset <name>          Reset a PocketBase instance (delete all data and optionally create a new admin account)
+    reset-admin <name>    Reset the admin password for a PocketBase instance
+
+  Instance Management:
+    start <name>          Start a specific PocketBase instance via PM2
+    stop <name>           Stop a specific PocketBase instance via PM2
+    restart <name>        Restart a specific PocketBase instance via PM2
+    logs <name>           Show logs for a specific PocketBase instance from PM2
+
+  Setup & Configuration:
+    setup [--version]     Initial setup: creates directories and downloads PocketBase
+    configure             Set or view CLI configurations (default Certbot email, PB version, logging)
+    update-pb             Update the PocketBase executable and restart all instances
+    update-ecosystem      Regenerate the PM2 ecosystem file and reload PM2
+
+  Other:
+    audit                 Show the audit log of commands executed by this CLI
+    help [command]        Show help for a specific command
+
+  Run all commands as root or with sudo.
+
+`;
 
 async function main() {
   if (process.geteuid && process.geteuid() !== 0) {

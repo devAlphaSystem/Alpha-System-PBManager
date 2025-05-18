@@ -1,6 +1,6 @@
 {
   "name": "alpha-system-pbmanager",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "main": "pb-manager.js",
   "scripts": {
     "start": "node pb-manager.js",

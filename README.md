@@ -25,6 +25,8 @@ Running multiple web applications, like PocketBase instances, on one server can 
 - Optionally, automate SSL certificate acquisition and renewal using Certbot for HTTPS.
 - Update the core PocketBase executable using its built-in update mechanism and restart instances.
 - Guide or automate the creation of the initial superuser (admin) account for each instance.
+- **Reset an instance to a clean state, deleting all its data.**
+- **Reset the admin password for an instance.**
 - Enforce that all commands are run as root or with `sudo` for system-level operations.
 - Offer an **interactive dashboard** to view instance status, resource usage, and perform quick actions.
 - Allow you to enable or disable **complete logging** for more or less verbose output.
@@ -44,7 +46,7 @@ Running multiple web applications, like PocketBase instances, on one server can 
 6.  **PM2:** For each instance, `pb-manager` generates an entry in a PM2 ecosystem file (`~/.pb-manager/ecosystem.config.js`). PM2 is then used to run, monitor, and manage the lifecycle of these PocketBase processes.
 7.  **Nginx:** When an instance is added, `pb-manager` generates a secure Nginx server block configuration file in `/etc/nginx/sites-available/` and creates a symbolic link in `/etc/nginx/sites-enabled/`. This configures Nginx to act as a reverse proxy, forwarding requests from a public domain to the instance's internal port.
 8.  **Certbot:** If HTTPS is enabled for an instance, `pb-manager` can attempt to run Certbot to obtain and install a Let's Encrypt SSL certificate for the specified domain. Certbot will modify the Nginx configuration to enable HTTPS. `pb-manager` also ensures a `dhparam.pem` file exists for stronger SSL.
-9.  **Superuser Creation:** When adding a new instance, `pb-manager` offers to create the initial PocketBase superuser (admin) account via the CLI, or guides you to do it via the web UI.
+9.  **Superuser Creation/Management:** When adding a new instance, `pb-manager` offers to create the initial PocketBase superuser (admin) account via the CLI, or guides you to do it via the web UI. It also provides a command to reset an admin's password.
 10. **Interactive Dashboard:** Uses `blessed` and `blessed-contrib` to render a terminal-based UI for real-time monitoring and management of instances.
 11. **Audit Log:** Every command run through `pb-manager` is recorded in an audit log (`~/.pb-manager/audit.log`) with a timestamp and details.
 12. **DNS Validation:** When adding an instance with HTTPS, `pb-manager` checks that the domain resolves and points to your server's public IP before proceeding with Certbot.
@@ -140,191 +142,135 @@ The installer will:
 
 A notification about new PocketBase versions (if available) and audit logging occur automatically before each command.
 
-### `dashboard`
+**Usage:**
+`sudo pb-manager <command> [options]`
+
+### Main Commands
+
+#### `dashboard`
 
 **Purpose:** Shows an interactive terminal-based dashboard for all managed PocketBase instances.
-
-**Usage:**
-`sudo pb-manager dashboard`
-
+**Usage:** `sudo pb-manager dashboard`
 **Features:**
 
-- Real-time view of:
-  - Instance Name, Domain, Port
-  - PM2 Status (Online/Offline/etc.)
-  - HTTP Health Check Status (OK/ERR)
-  - SSL Status (Yes/No)
-  - CPU and Memory usage per instance (from PM2)
-  - Instance Uptime
-  - Data Directory Size
-- **Hotkeys for actions:**
-  - `q` or `Ctrl+C`: Quit dashboard.
-  - `r`: Refresh data immediately.
-  - `l`: View logs for the selected instance (exits dashboard).
-  - `s`: Start/Stop the selected instance.
-  - `d`: Delete the selected instance (exits dashboard and runs the remove command).
+- Real-time view of: Instance Name, Domain, Port, PM2 Status, HTTP Health Check, SSL Status, CPU/Memory usage, Uptime, Data Directory Size.
+- **Hotkeys:** `q` (Quit), `r` (Refresh), `l` (Logs), `s` (Start/Stop), `d` (Delete).
 
-### `configure`
-
-**Purpose:** Set or view global CLI configurations for `pb-manager`.
-
-**Usage:**
-`sudo pb-manager configure`
-
-**Details:**
-This interactive command allows you to:
-
-- Set/View the **Default Certbot Email**.
-- Set/View the **Default PocketBase Version** (for `setup` if no version is specified).
-- **Enable/disable complete logging:** Toggle verbose output for all commands.
-- View the current raw JSON configuration.
-
-### `setup`
-
-**Purpose:** Performs initial setup for `pb-manager`. Creates necessary configuration directories and downloads the PocketBase executable.
-
-**Usage:**
-`sudo pb-manager setup [options]`
-
-**Options:**
-
-- `-v, --version <version>`: Specify a particular PocketBase version (e.g., `0.28.1`) to download. If not provided, it uses the version from `cli-config.json` (if set), or fetches the latest available version.
-
-**Example:**
-
-```bash
-sudo pb-manager setup
-sudo pb-manager setup -v 0.28.1
-```
-
-### `add`
+#### `add`
 
 **Purpose:** Adds and configures a new PocketBase instance.
+**Usage:** `sudo pb-manager add`
+**Details:** Interactive prompts for instance name, domain, port, HTTP/2, max body size, HTTPS (Certbot), and initial admin creation.
+**Actions:** DNS validation, data directory creation, Nginx config generation, Certbot (optional), PM2 setup, admin creation (optional).
 
-**Usage:**
-`sudo pb-manager add`
-
-**Details:**
-This interactive command will prompt you for:
-
-1.  **Instance name:** A short, unique, alphanumeric name (e.g., `my-blog`).
-2.  **Domain/subdomain:** The public domain (e.g., `blog.example.com`).
-3.  **Internal port:** A unique internal port (e.g., `8091`).
-4.  **Enable HTTP/2 in Nginx config?** (Default: Yes)
-5.  **Set 20Mb max body size in Nginx config?** (Default: Yes, for file uploads)
-6.  **Configure HTTPS (Certbot)?** (Default: Yes)
-7.  **(If HTTPS) Use default email for Let's Encrypt?** (If one is set in `cli-config.json`)
-8.  **(If HTTPS and not using default/no default) Enter email for Let's Encrypt.**
-9.  **(If HTTPS) Attempt to automatically run Certbot now?** (Default: Yes)
-10. **Create superuser (admin) account via CLI now?** (Default: Yes)
-
-**Actions Performed:**
-
-- **DNS Validation:** If HTTPS is enabled, `pb-manager` validates that the domain's A/AAAA records point to your server. Aborts if validation fails.
-- Creates a data directory.
-- Saves instance configuration.
-- Generates and enables a secure Nginx configuration (with HTTP/2, security headers, max body size as chosen).
-- Ensures `dhparam.pem` exists for SSL.
-- Reloads Nginx.
-- (If chosen for HTTPS & auto-Certbot) Runs Certbot. If Certbot succeeds, Nginx config is updated for SSL.
-- Updates PM2 ecosystem file and starts/reloads the instance via PM2.
-- (If chosen) Creates the PocketBase superuser (admin) account via CLI.
-- Provides URLs and guidance for accessing the new instance.
-
-### `list`
+#### `list [--json]`
 
 **Purpose:** Lists all PocketBase instances managed by `pb-manager`.
-
-**Usage:**
-`sudo pb-manager list [--json]`
-
+**Usage:** `sudo pb-manager list` or `sudo pb-manager list --json`
 **Options:**
 
 - `--json`: Output the list in JSON format.
+  **Details:** Displays Name, Domain, Protocol, Public URL, Internal Port, Data Directory, PM2 Status, Local Admin URL, SSL Expiry.
 
-**Details:**
-Displays a summary for each instance, including: Name, Domain, Protocol (HTTP/HTTPS), Public Admin URL, Internal Port, Data Directory, PM2 Status, Local Admin URL, and SSL Certificate Expiry Days (if HTTPS).
-
-### `remove <name>`
+#### `remove <name>`
 
 **Purpose:** Removes a managed PocketBase instance.
-
-**Usage:**
-`sudo pb-manager remove <instance-name>`
-
+**Usage:** `sudo pb-manager remove <instance-name>`
 **Arguments:**
 
 - `<instance-name>`: The name of the instance to remove.
+  **Details:** Confirms action, stops/deletes PM2 process, removes Nginx config. **Data directory is NOT deleted automatically.**
 
-**Details:**
+#### `reset <name>`
 
-- Asks for confirmation.
-- Stops and deletes the instance's PM2 process.
-- Removes Nginx configuration files and symlinks.
-- Removes the instance's entry from `instances.json`.
-- Reloads Nginx and updates/saves PM2 state.
-- **Important:** Does **not** delete the instance's data directory (`~/.pb-manager/instances_data/<instance-name>/`). This must be done manually.
+**Purpose:** Resets a PocketBase instance to its initial state. **This is a destructive operation.**
+**Usage:** `sudo pb-manager reset <instance-name>`
+**Arguments:**
 
-### `start <name>`
+- `<instance-name>`: The name of the instance to reset.
+  **Details:**
+- Asks for explicit confirmation.
+- Stops and removes the instance's PM2 process.
+- **Deletes the entire data directory** for the instance (e.g., `~/.pb-manager/instances_data/<instance-name>/`).
+- Recreates an empty data directory.
+- Updates PM2 and restarts the instance.
+- Prompts to create a new superuser (admin) account.
+
+#### `reset-admin <name>`
+
+**Purpose:** Resets the password for a superuser (admin) account of a specific PocketBase instance.
+**Usage:** `sudo pb-manager reset-admin <instance-name>`
+**Arguments:**
+
+- `<instance-name>`: The name of the instance.
+  **Details:**
+- Prompts for the admin email and the new password.
+- Uses the PocketBase `superuser update` command.
+
+### Instance Management
+
+#### `start <name>`
 
 **Purpose:** Starts a specific PocketBase instance via PM2.
+**Usage:** `sudo pb-manager start <instance-name>`
 
-**Usage:**
-`sudo pb-manager start <instance-name>`
-
-### `stop <name>`
+#### `stop <name>`
 
 **Purpose:** Stops a specific PocketBase instance via PM2.
+**Usage:** `sudo pb-manager stop <instance-name>`
 
-**Usage:**
-`sudo pb-manager stop <instance-name>`
-
-### `restart <name>`
+#### `restart <name>`
 
 **Purpose:** Restarts a specific PocketBase instance via PM2.
+**Usage:** `sudo pb-manager restart <instance-name>`
 
-**Usage:**
-`sudo pb-manager restart <instance-name>`
-
-### `logs <name>`
+#### `logs <name>`
 
 **Purpose:** Displays logs for a specific PocketBase instance from PM2.
+**Usage:** `sudo pb-manager logs <instance-name>` (Tails logs, `Ctrl+C` to exit.)
 
-**Usage:**
-`sudo pb-manager logs <instance-name>`
-(Tails logs, press `Ctrl+C` to exit.)
+### Setup & Configuration
 
-### `update-pb`
+#### `setup [--version]`
 
-**Purpose:** Updates the core PocketBase executable using PocketBase's built-in `update` command. After updating, it restarts all managed instances.
+**Purpose:** Performs initial setup. Creates directories and downloads the PocketBase executable.
+**Usage:** `sudo pb-manager setup` or `sudo pb-manager setup -v <version>`
+**Options:**
 
-**Usage:**
-`sudo pb-manager update-pb`
+- `-v, --version <version>`: Specify PocketBase version (e.g., `0.28.1`). Defaults to latest or configured version.
 
-**Details:**
+#### `configure`
 
-- Checks if the PocketBase executable exists.
-- Runs `<path-to-pocketbase-executable> update`. This command makes the PocketBase binary update itself in place.
-- If the update is successful, it iterates through all managed instances and restarts their PM2 processes.
+**Purpose:** Set or view global CLI configurations.
+**Usage:** `sudo pb-manager configure`
+**Details:** Interactive command for Default Certbot Email, Default PocketBase Version, and complete logging preference.
 
-### `audit`
+#### `update-pb`
+
+**Purpose:** Updates the core PocketBase executable and restarts all instances.
+**Usage:** `sudo pb-manager update-pb`
+**Details:** Runs PocketBase's built-in `update` command, then restarts all managed instances via PM2.
+
+#### `update-ecosystem`
+
+**Purpose:** Regenerates the PM2 ecosystem file and reloads PM2.
+**Usage:** `sudo pb-manager update-ecosystem`
+
+### Other
+
+#### `audit`
 
 **Purpose:** Displays the audit log of commands executed by `pb-manager`.
+**Usage:** `sudo pb-manager audit` (Shows `~/.pb-manager/audit.log`)
 
-**Usage:**
-`sudo pb-manager audit`
-(Shows contents of `~/.pb-manager/audit.log`)
+#### `help [command]`
 
-### `update-ecosystem`
-
-**Purpose:** Regenerates the PM2 ecosystem file based on current `instances.json` and reloads PM2. Useful if manual changes are needed or to ensure PM2 is in sync.
-
-**Usage:**
-`sudo pb-manager update-ecosystem`
+**Purpose:** Show help for `pb-manager` or a specific command.
+**Usage:** `sudo pb-manager help` or `sudo pb-manager help <command-name>`
 
 ## Superuser (Admin) Account Creation
 
-When adding a new instance, `pb-manager` offers to create the initial superuser (admin) account via the CLI. It uses a command similar to:
+When adding a new instance (`pb-manager add`) or resetting an instance (`pb-manager reset`), `pb-manager` offers to create the initial superuser (admin) account via the CLI. It uses a command similar to:
 `pocketbase superuser create "<email>" "<password>" --dir "<instance_data_dir>" --migrationsDir "<instance_data_dir>/pb_migrations"`
 
 If you opt-out or it fails, you can create it via the web admin UI:
@@ -333,11 +279,13 @@ If you opt-out or it fails, you can create it via the web admin UI:
 - Alternatively, for local access/troubleshooting: `http://127.0.0.1:<instance_port>/_/` (may require SSH port forwarding for headless servers: `ssh -L <instance_port>:127.0.0.1:<instance_port> user@your_server_ip`).
 - PocketBase will prompt you to create the first admin account.
 
+If you need to reset an existing admin password, you can use the `pb-manager reset-admin <instance-name>` command.
+
 ## Nginx Configuration Features
 
 - **HTTP/2:** Optionally enabled per instance for improved performance.
 - **Security Headers:** Includes `Strict-Transport-Security`, `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection` by default.
-- **Upload Limit:** Optionally set `client_max_body_size 20M` (or other values if manually edited later) per instance.
+- **Upload Limit:** Optionally set `client_max_body_size 20M` per instance.
 - **HTTPS:** Full Let's Encrypt integration via Certbot.
 - **Automatic HTTP to HTTPS redirection** when HTTPS is enabled and Certbot succeeds.
 
@@ -370,7 +318,9 @@ While `pb-manager` aims to automate and simplify, be aware of:
 - **PM2 Problems:** Instances might not start/restart correctly. Check `pm2 logs`.
 - **Permissions:** Ensure correct file system permissions. Running with `sudo` generally handles this.
 - **PocketBase Updates:** Breaking changes in PocketBase itself could affect instances. Review release notes.
-- **Data Loss Risk:** The `remove` command doesn't delete data by default, but **always back up your data independently.**
+- **Data Loss Risk:**
+  - The `remove` command doesn't delete data by default, but **always back up your data independently.**
+  - The `reset <name>` command is **highly destructive** and will permanently delete all data for the specified instance. Use with extreme caution.
 - **Script Bugs:** The tool may have bugs. Test in non-critical environments first.
 - **Network Connectivity:** Required for downloads and API interactions.
 - **Resource Limits:** Monitor server resources if running many instances.
