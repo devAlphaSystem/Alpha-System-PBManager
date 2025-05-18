@@ -274,12 +274,12 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
   }
 }
 
-function runCommand(command, errorMessage, ignoreError = false) {
+function runCommand(command, errorMessage, ignoreError = false, options = {}) {
   if (completeLogging) {
     console.log(chalk.yellow(`Executing: ${command}`));
   }
 
-  const result = shell.exec(command, { silent: !completeLogging });
+  const result = shell.exec(command, { silent: !completeLogging, ...options });
   if (result.code !== 0 && !ignoreError) {
     console.error(chalk.red(errorMessage || `Error executing command: ${command}`));
 
@@ -927,6 +927,7 @@ program
 
 program
   .command("add")
+  .alias("create")
   .description("Add a new PocketBase instance")
   .action(async () => {
     if (process.geteuid && process.geteuid() !== 0) {
@@ -1191,7 +1192,7 @@ program
   });
 
 program
-  .command("update-pb")
+  .command("update-pocketbase")
   .description("Updates the PocketBase executable using 'pocketbase update' and restarts all instances.")
   .action(async () => {
     if (process.geteuid && process.geteuid() !== 0) {
@@ -1726,6 +1727,66 @@ program
     }
   });
 
+program
+  .command("update-pb-manager")
+  .description("Update pb-manager itself from the latest version on GitHub")
+  .action(async () => {
+    if (process.geteuid && process.geteuid() !== 0) {
+      console.error(chalk.red("You must run this script as root or with sudo."));
+
+      process.exit(1);
+    }
+
+    const GITHUB_USER = "devAlphaSystem";
+    const GITHUB_REPO = "Alpha-System-PBManager";
+    const GITHUB_BRANCH = "main";
+    const SCRIPT_URL = `https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}/pb-manager.js`;
+
+    let installPath = process.argv[1];
+    if (!installPath || !installPath.endsWith("pb-manager.js")) {
+      installPath = "/opt/pb-manager/pb-manager.js";
+    }
+
+    console.log(chalk.cyan(`Updating pb-manager from ${SCRIPT_URL}`));
+    try {
+      const response = await axios.get(SCRIPT_URL, { responseType: "text" });
+      await fs.writeFile(installPath, response.data, { mode: 0o755 });
+
+      console.log(chalk.green(`pb-manager.js updated at ${installPath}`));
+    } catch (e) {
+      console.error(chalk.red("Failed to download or write pb-manager.js:"), e.message);
+
+      process.exit(1);
+    }
+
+    const { reinstall } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "reinstall",
+        message: "Do you want to reinstall Node.js dependencies (npm install) in the install directory?",
+        default: false,
+      },
+    ]);
+
+    if (reinstall) {
+      try {
+        const installDir = path.dirname(installPath);
+
+        console.log(chalk.cyan("Running npm install..."));
+
+        runCommand("npm install", "Failed to install dependencies", false, { cwd: installDir });
+
+        console.log(chalk.green("Dependencies installed."));
+      } catch (e) {
+        console.error(chalk.red("Failed to install dependencies:"), e.message);
+      }
+    }
+
+    console.log(chalk.bold.green("pb-manager has been updated. Please re-run your command if needed."));
+
+    process.exit(0);
+  });
+
 async function appendAuditLog(command, details) {
   const auditLogPath = path.join(CONFIG_DIR, "audit.log");
   const logEntry = `${new Date().toISOString()} - Command: ${command}; Details: ${details}\n`;
@@ -1763,12 +1824,14 @@ program.helpInformation = () => `
   PocketBase Manager (pb-manager)
   A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
 
+  Version: 0.2.4
+
   Usage:
     sudo pb-manager <command> [options]
 
   Main Commands:
     dashboard             Show interactive dashboard for all PocketBase instances
-    add                   Add a new PocketBase instance
+    add | create          Register a new PocketBase instance
     list [--json]         List all managed PocketBase instances
     remove <name>         Remove a PocketBase instance
     reset <name>          Reset a PocketBase instance (delete all data and optionally create a new admin account)
@@ -1783,11 +1846,14 @@ program.helpInformation = () => `
   Setup & Configuration:
     setup [--version]     Initial setup: creates directories and downloads PocketBase
     configure             Set or view CLI configurations (default Certbot email, PB version, logging)
-    update-pb             Update the PocketBase executable and restart all instances
+
+  Updates:
+    update-pocketbase     Update the PocketBase executable and restart all instances
     update-ecosystem      Regenerate the PM2 ecosystem file and reload PM2
+    update-pb-manager     Update the pb-manager CLI from GitHub
 
   Other:
-    audit                 Show the audit log of commands executed by this CLI
+    audit                 Show the history of commands executed by this CLI
     help [command]        Show help for a specific command
 
   Run all commands as root or with sudo.
