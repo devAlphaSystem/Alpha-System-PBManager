@@ -34,6 +34,7 @@ Running multiple web applications, like PocketBase instances, on one server can 
 - Perform **DNS validation**: Before finalizing HTTPS configuration, validates that the domain's DNS A/AAAA records point to your server.
 - Provide **PocketBase version notification**: Notifies you (with a 24h cache) when a new PocketBase version is available, at the start of every command.
 - **Update itself**: Can fetch and install the latest version of `pb-manager` from GitHub.
+- Renew SSL certificates for all instances using Certbot, with options to force renewal.
 
 ## How It Works
 
@@ -143,37 +144,39 @@ The installer will:
   PocketBase Manager (pb-manager)
   A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
 
-  Version: 0.2.4
+  Version: 0.2.5
 
   Usage:
     sudo pb-manager <command> [options]
 
   Main Commands:
-    dashboard             Show interactive dashboard for all PocketBase instances
-    add | create          Register a new PocketBase instance
-    list [--json]         List all managed PocketBase instances
-    remove <name>         Remove a PocketBase instance
-    reset <name>          Reset a PocketBase instance (delete all data and optionally create a new admin account)
-    reset-admin <name>    Reset the admin password for a PocketBase instance
+    dashboard                       Show interactive dashboard for all PocketBase instances
+    add | create                    Register a new PocketBase instance
+    clone <sourceName> <newName>    Clone an existing instance's data and config to a new one
+    list [--json]                   List all managed PocketBase instances
+    remove <name>                   Remove a PocketBase instance
+    reset <name>                    Reset a PocketBase instance (delete all data and optionally create a new admin account)
+    reset-admin <name>              Reset the admin password for a PocketBase instance
 
   Instance Management:
-    start <name>          Start a specific PocketBase instance via PM2
-    stop <name>           Stop a specific PocketBase instance via PM2
-    restart <name>        Restart a specific PocketBase instance via PM2
-    logs <name>           Show logs for a specific PocketBase instance from PM2
+    start <name>                    Start a specific PocketBase instance via PM2
+    stop <name>                     Stop a specific PocketBase instance via PM2
+    restart <name>                  Restart a specific PocketBase instance via PM2
+    logs <name>                     Show logs for a specific PocketBase instance from PM2
 
   Setup & Configuration:
-    setup [--version]     Initial setup: creates directories and downloads PocketBase
-    configure             Set or view CLI configurations (default Certbot email, PB version, logging)
+    setup [--version]               Initial setup: creates directories and downloads PocketBase
+    configure                       Set or view CLI configurations (default Certbot email, PB version, logging)
 
-  Updates:
-    update-pocketbase     Update the PocketBase executable and restart all instances
-    update-ecosystem      Regenerate the PM2 ecosystem file and reload PM2
-    update-pb-manager     Update the pb-manager CLI from GitHub
+  Updates & Maintenance:
+    renew-certificates [name|all]   Renew SSL certificates using Certbot (use --force to force renewal)
+    update-pocketbase               Update the PocketBase executable and restart all instances
+    update-ecosystem                Regenerate the PM2 ecosystem file and reload PM2
+    update-pb-manager               Update the pb-manager CLI from GitHub
 
   Other:
-    audit                 Show the history of commands executed by this CLI
-    help [command]        Show help for a specific command
+    audit                           Show the history of commands executed by this CLI (includes errors)
+    help [command]                  Show help for a specific command
 
   Run all commands as root or with sudo.
 ```
@@ -197,6 +200,20 @@ A notification about new PocketBase versions (if available) and audit logging oc
 **Usage:** `sudo pb-manager add`
 **Details:** Interactive prompts for instance name, domain, port, HTTP/2, max body size, HTTPS (Certbot), and initial admin creation.
 **Actions:** DNS validation, data directory creation, Nginx config generation (including `dhparam.pem` check), Certbot (optional), PM2 setup, admin creation (optional).
+
+#### `clone <sourceName> <newName>`
+
+**Purpose:** Clones an existing PocketBase instance's data and configuration to a new instance.
+**Usage:** `sudo pb-manager clone <source-instance-name> <new-instance-name>`
+**Arguments:**
+
+- `<source-instance-name>`: The name of the existing instance to clone.
+- `<new-instance-name>`: The name for the new cloned instance.
+  **Details:**
+- Copies the entire data directory from the source instance.
+- Prompts for new domain, port, and other configuration details for the cloned instance, similar to the `add` command.
+- Sets up Nginx, PM2, and optionally Certbot for the new instance.
+- Offers to create an _additional_ superuser for the cloned instance (existing users are cloned).
 
 #### `list [--json]`
 
@@ -280,13 +297,25 @@ A notification about new PocketBase versions (if available) and audit logging oc
 **Usage:** `sudo pb-manager configure`
 **Details:** Interactive command for Default Certbot Email, Default PocketBase Version for new setups, and complete logging preference.
 
-### Updates
+### Updates & Maintenance
 
 #### `update-pocketbase`
 
 **Purpose:** Updates the core PocketBase executable and restarts all instances.
 **Usage:** `sudo pb-manager update-pocketbase`
 **Details:** Runs PocketBase's built-in `update` command using the executable in `~/.pb-manager/bin/pocketbase`, then restarts all managed instances via PM2.
+
+#### `renew-certificates [instanceName|all]`
+
+**Purpose:** Renews SSL certificates using Certbot.
+**Usage:** `sudo pb-manager renew-certificates [instance-name|all] [--force]`
+**Arguments:**
+
+- `[instance-name]`: (Optional) The name of a specific instance whose certificate should be renewed.
+- `all`: (Optional, default if no name provided) Attempts to renew all certificates managed by Certbot that are due.
+  **Options:**
+- `-f, --force`: Force Certbot to attempt renewal even if the certificate is not yet due for expiry.
+  **Details:** Reloads Nginx after renewal attempts.
 
 #### `update-ecosystem`
 
@@ -308,7 +337,7 @@ A notification about new PocketBase versions (if available) and audit logging oc
 
 #### `audit`
 
-**Purpose:** Displays the audit log of commands executed by `pb-manager`.
+**Purpose:** Displays the audit log of commands executed by `pb-manager`, including any errors that occurred during command execution.
 **Usage:** `sudo pb-manager audit` (Shows `~/.pb-manager/audit.log`)
 
 #### `help [command]`
@@ -318,14 +347,14 @@ A notification about new PocketBase versions (if available) and audit logging oc
 
 ## Superuser (Admin) Account Creation
 
-When adding a new instance (`pb-manager add`) or resetting an instance (`pb-manager reset`), `pb-manager` offers to create the initial superuser (admin) account via the CLI. It uses a command similar to:
+When adding a new instance (`pb-manager add`), cloning an instance (`pb-manager clone`), or resetting an instance (`pb-manager reset`), `pb-manager` offers to create the initial/additional superuser (admin) account via the CLI. It uses a command similar to:
 `pocketbase superuser create "<email>" "<password>" --dir "<instance_data_dir>" --migrationsDir "<instance_data_dir>/pb_migrations"`
 
 If you opt-out or it fails, you can create it via the web admin UI:
 
 - Visit `https://your-domain.com/_/` (if HTTPS is set up) or `http://your-domain.com/_/`.
 - Alternatively, for local access/troubleshooting: `http://127.0.0.1:<instance_port>/_/` (may require SSH port forwarding for headless servers: `ssh -L <instance_port>:127.0.0.1:<instance_port> user@your_server_ip`).
-- PocketBase will prompt you to create the first admin account.
+- PocketBase will prompt you to create the first admin account if none exist. For cloned instances, existing admin accounts from the source will be available.
 
 If you need to reset an existing admin password, you can use the `pb-manager reset-admin <instance-name>` command.
 
@@ -347,7 +376,7 @@ If you need to reset an existing admin password, you can use the `pb-manager res
 
 ## Audit Log
 
-All `pb-manager` commands are logged to `~/.pb-manager/audit.log` with a timestamp and the full command executed. This provides a trail of administrative actions performed by the tool.
+All `pb-manager` commands are logged to `~/.pb-manager/audit.log` with a timestamp, the full command executed, and any errors that occurred during the command's execution. This provides a trail of administrative actions performed by the tool.
 
 ## PocketBase Version Notification
 
@@ -370,6 +399,7 @@ While `pb-manager` aims to automate and simplify, be aware of:
 - **Data Loss Risk:**
   - The `remove` command doesn't delete data by default, but **always back up your data independently.**
   - The `reset <name>` command is **highly destructive** and will permanently delete all data for the specified instance. Use with extreme caution.
+  - The `clone <sourceName> <newName>` command copies data. Ensure the source data is what you intend to replicate.
 - **Script Bugs:** The tool may have bugs. Test in non-critical environments first.
 - **Network Connectivity:** Required for downloads and API interactions.
 - **Resource Limits:** Monitor server resources if running many instances.

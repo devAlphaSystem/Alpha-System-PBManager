@@ -32,6 +32,33 @@ let completeLogging = false;
 let _latestPocketBaseVersionCache = null;
 const FALLBACK_POCKETBASE_VERSION = "0.28.1";
 
+let currentCommandNameForAudit = "pb-manager";
+let currentCommandArgsForAudit = "";
+
+async function appendAuditLog(command, details, error = null) {
+  const auditLogPath = path.join(CONFIG_DIR, "audit.log");
+  const timestamp = new Date().toISOString();
+
+  let logEntry;
+
+  if (error) {
+    const errorMessage = String(error.message || error).replace(/\n/g, " ");
+
+    logEntry = `${timestamp} - ERROR during command: ${command} (Args: ${details || "N/A"}) - Message: ${errorMessage}\n`;
+  } else {
+    logEntry = `${timestamp} - Command: ${command}; Args: ${details || "N/A"}\n`;
+  }
+
+  try {
+    await fs.ensureDir(CONFIG_DIR);
+    await fs.appendFile(auditLogPath, logEntry);
+  } catch (e) {
+    if (completeLogging) {
+      console.log(chalk.red(`Failed to append to audit log: ${e.message}`));
+    }
+  }
+}
+
 async function validateDnsRecords(domain) {
   try {
     const publicIpRes = await axios.get("https://api.ipify.org?format=json");
@@ -794,12 +821,6 @@ program
   .command("dashboard")
   .description("Show interactive dashboard for all PocketBase instances")
   .action(async () => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     await showDashboard();
   });
 
@@ -911,12 +932,6 @@ program
   .description("Initial setup: creates directories and downloads PocketBase.")
   .option("-v, --version <version>", "Specify PocketBase version to download for setup")
   .action(async (options) => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     console.log(chalk.bold.cyan("Starting PocketBase Manager Setup..."));
 
     await ensureBaseSetup();
@@ -930,12 +945,6 @@ program
   .alias("create")
   .description("Add a new PocketBase instance")
   .action(async () => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     const cliConfig = await getCliConfig();
 
     await ensureBaseSetup();
@@ -1192,15 +1201,281 @@ program
   });
 
 program
+  .command("clone <sourceName> <newName>")
+  .description("Clone an existing PocketBase instance's data and configuration to a new instance.")
+  .action(async (sourceName, newName) => {
+    const cliConfig = await getCliConfig();
+
+    await ensureBaseSetup();
+
+    if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+      console.log(chalk.yellow("PocketBase executable not found. Running initial setup..."));
+
+      await downloadPocketBaseIfNotExists();
+
+      if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+        console.error(chalk.red("PocketBase download failed. Cannot clone instance."));
+
+        return;
+      }
+    }
+
+    const config = await getInstancesConfig();
+    const sourceInstance = config.instances[sourceName];
+
+    if (!sourceInstance) {
+      console.error(chalk.red(`Source instance "${sourceName}" not found.`));
+
+      return;
+    }
+
+    if (config.instances[newName]) {
+      console.error(chalk.red(`Target instance "${newName}" already exists.`));
+
+      return;
+    }
+
+    console.log(chalk.blue(`Cloning instance "${sourceName}" to "${newName}"...`));
+
+    const cloneAnswers = await inquirer.prompt([
+      {
+        type: "input",
+        name: "domain",
+        message: `Domain/subdomain for new instance "${newName}":`,
+        default: `cloned-${sourceInstance.domain}`,
+        validate: (input) => (input.length > 0 ? true : "Domain cannot be empty."),
+      },
+      {
+        type: "number",
+        name: "port",
+        message: `Internal port for new instance "${newName}":`,
+        default: sourceInstance.port + 1,
+        validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port."),
+      },
+      {
+        type: "confirm",
+        name: "useHttp2",
+        message: "Enable HTTP/2 in Nginx config for new instance?",
+        default: sourceInstance.useHttp2,
+      },
+      {
+        type: "confirm",
+        name: "maxBody20Mb",
+        message: "Set 20Mb max body size in Nginx config for new instance?",
+        default: sourceInstance.maxBody20Mb,
+      },
+    ]);
+
+    for (const instName in config.instances) {
+      if (config.instances[instName].port === cloneAnswers.port) {
+        console.error(chalk.red(`Port ${cloneAnswers.port} is already in use by another managed instance.`));
+
+        return;
+      }
+
+      if (config.instances[instName].domain === cloneAnswers.domain) {
+        console.error(chalk.red(`Domain ${cloneAnswers.domain} is already in use by another managed instance.`));
+
+        return;
+      }
+    }
+
+    let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
+
+    const httpsAnswers = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "useHttps",
+        message: `Configure HTTPS (Certbot) for "${newName}"?`,
+        default: sourceInstance.useHttps,
+      },
+      {
+        type: "confirm",
+        name: "useDefaultEmail",
+        message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`,
+        default: true,
+        when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail,
+      },
+      {
+        type: "input",
+        name: "emailForCertbot",
+        message: "Enter email for Let's Encrypt:",
+        when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail),
+        validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."),
+        default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? sourceInstance.emailForCertbot : cliConfig.defaultCertbotEmail),
+      },
+      {
+        type: "confirm",
+        name: "autoRunCertbot",
+        message: "Attempt to automatically run Certbot now to obtain the SSL certificate?",
+        default: true,
+        when: (answers) => answers.useHttps,
+      },
+    ]);
+
+    if (httpsAnswers.useHttps) {
+      const dnsValid = await validateDnsRecords(cloneAnswers.domain);
+      if (!dnsValid) {
+        console.error(chalk.red(`DNS validation failed for domain ${cloneAnswers.domain} - DNS records do not point to this server.`));
+        return;
+      }
+
+      if (cliConfig.defaultCertbotEmail && httpsAnswers.useDefaultEmail) {
+        emailToUseForCertbot = cliConfig.defaultCertbotEmail;
+      } else {
+        emailToUseForCertbot = httpsAnswers.emailForCertbot;
+      }
+
+      if (!emailToUseForCertbot) {
+        console.error(chalk.red("Certbot email is required for HTTPS setup. Aborting."));
+
+        return;
+      }
+    }
+
+    const newInstanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, newName);
+
+    await fs.ensureDir(path.dirname(newInstanceDataDir));
+
+    console.log(chalk.blue(`Copying data from ${sourceInstance.dataDir} to ${newInstanceDataDir}...`));
+
+    try {
+      await fs.copy(sourceInstance.dataDir, newInstanceDataDir);
+
+      console.log(chalk.green("Data copied successfully."));
+    } catch (err) {
+      console.error(chalk.red(`Error copying data: ${err.message}`));
+
+      return;
+    }
+
+    config.instances[newName] = {
+      name: newName,
+      domain: cloneAnswers.domain,
+      port: cloneAnswers.port,
+      dataDir: newInstanceDataDir,
+      useHttps: httpsAnswers.useHttps,
+      emailForCertbot: httpsAnswers.useHttps ? emailToUseForCertbot : null,
+      useHttp2: cloneAnswers.useHttp2,
+      maxBody20Mb: cloneAnswers.maxBody20Mb,
+    };
+
+    await saveInstancesConfig(config);
+
+    console.log(chalk.green(`Instance "${newName}" configuration saved.`));
+
+    let certbotSuccess = false;
+
+    const nginxConfigParams = {
+      instanceName: newName,
+      domain: cloneAnswers.domain,
+      port: cloneAnswers.port,
+      useHttp2: cloneAnswers.useHttp2,
+      maxBody20Mb: cloneAnswers.maxBody20Mb,
+    };
+
+    if (httpsAnswers.useHttps) {
+      await ensureDhParamExists();
+
+      if (httpsAnswers.autoRunCertbot) {
+        await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, false, nginxConfigParams.maxBody20Mb);
+        await reloadNginx();
+
+        certbotSuccess = await runCertbot(cloneAnswers.domain, emailToUseForCertbot);
+        if (certbotSuccess) {
+          await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
+        } else {
+          await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
+        }
+      } else {
+        await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
+
+        console.log(chalk.yellow(`To obtain a certificate later, run: sudo certbot --nginx -d ${cloneAnswers.domain} -m ${emailToUseForCertbot}`));
+      }
+    } else {
+      await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
+    }
+
+    await reloadNginx();
+    await updatePm2EcosystemFile();
+    await reloadPm2();
+
+    let adminCreatedViaCli = false;
+
+    const { createAdminCli } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "createAdminCli",
+        message: `Data has been cloned. Do you want to create an *additional* superuser (admin) account for "${newName}" via CLI now?`,
+        default: false,
+      },
+    ]);
+
+    if (createAdminCli) {
+      const adminCredentials = await inquirer.prompt([
+        {
+          type: "input",
+          name: "adminEmail",
+          message: "Enter new admin email:",
+          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+        },
+        {
+          type: "password",
+          name: "adminPassword",
+          message: "Enter new admin password (min 8 chars):",
+          mask: "*",
+          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+        },
+      ]);
+
+      const migrationsDir = path.join(newInstanceDataDir, "pb_migrations");
+      const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminCredentials.adminEmail}" "${adminCredentials.adminPassword}" --dir "${newInstanceDataDir}" --migrationsDir "${migrationsDir}"`;
+
+      if (completeLogging) {
+        console.log(chalk.blue("\nAttempting to create superuser (admin) account via CLI..."));
+        console.log(chalk.yellow(`Executing: ${adminCreateCommand}`));
+      }
+
+      try {
+        const result = runCommand(adminCreateCommand, "Failed to create superuser (admin) account via CLI.");
+        if (result?.stdout?.includes("Successfully created new superuser")) {
+          console.log(result.stdout.trim());
+        }
+
+        console.log(chalk.green(`Superuser (admin) account for ${adminCredentials.adminEmail} created successfully for "${newName}"!`));
+
+        adminCreatedViaCli = true;
+      } catch (e) {
+        console.error(chalk.red(`Superuser (admin) account creation for "${newName}" via CLI failed. The user might already exist in the cloned data, or another error occurred.`));
+      }
+    }
+
+    console.log(chalk.bold.green(`\nInstance "${newName}" cloned and started!`));
+
+    const protocol = httpsAnswers.useHttps && certbotSuccess ? "https" : "http";
+    const publicBaseUrl = `${protocol}://${cloneAnswers.domain}`;
+    const localAdminUrl = `http://127.0.0.1:${cloneAnswers.port}/_/`;
+
+    console.log(chalk.blue("\nNew Cloned Instance Details:"));
+    console.log(chalk.blue(`  Public URL: ${publicBaseUrl}/_/`));
+    console.log(chalk.yellow("Remember that all data, including users and admins, has been cloned from the source instance."));
+
+    if (!adminCreatedViaCli && !createAdminCli) {
+      console.log(chalk.yellow(`You can access the admin panel for "${newName}" using existing credentials from "${sourceName}" or create/reset admins via the UI or 'pb-manager reset-admin ${newName}'.`));
+    }
+
+    console.log(chalk.yellow(`   - Public Admin: ${publicBaseUrl}/_/`));
+    console.log(chalk.yellow(`   - Local Admin (direct access): ${localAdminUrl}`));
+
+    if (httpsAnswers.useHttps && !certbotSuccess && httpsAnswers.autoRunCertbot) {
+      console.log(chalk.red(`\nCertbot failed for "${newName}". The instance might only be available via HTTP.`));
+    }
+  });
+
+program
   .command("update-pocketbase")
   .description("Updates the PocketBase executable using 'pocketbase update' and restarts all instances.")
   .action(async () => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     console.log(chalk.bold.cyan("Attempting to update PocketBase executable..."));
 
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
@@ -1268,12 +1543,6 @@ program
   .command("remove <name>")
   .description("Remove a PocketBase instance")
   .action(async (name) => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     const config = await getInstancesConfig();
     if (!config.instances[name]) {
       console.error(chalk.red(`Instance "${name}" not found.`));
@@ -1462,12 +1731,6 @@ program
   .command("start <name>")
   .description("Start a specific PocketBase instance via PM2")
   .action(async (name) => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     try {
       runCommand(`pm2 start pb-${name}`);
 
@@ -1481,12 +1744,6 @@ program
   .command("stop <name>")
   .description("Stop a specific PocketBase instance via PM2")
   .action(async (name) => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     try {
       runCommand(`pm2 stop pb-${name}`);
 
@@ -1500,12 +1757,6 @@ program
   .command("restart <name>")
   .description("Restart a specific PocketBase instance via PM2")
   .action(async (name) => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     try {
       runCommand(`pm2 restart pb-${name}`);
 
@@ -1519,12 +1770,6 @@ program
   .command("logs <name>")
   .description("Show logs for a specific PocketBase instance from PM2")
   .action((name) => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     console.log(chalk.blue(`Displaying logs for pb-${name}. Press Ctrl+C to exit.`));
 
     shell.exec(`pm2 logs pb-${name} --lines 50`);
@@ -1534,12 +1779,6 @@ program
   .command("audit")
   .description("Show the audit log of commands executed by this CLI")
   .action(async () => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     const auditLogPath = path.join(CONFIG_DIR, "audit.log");
     if (await fs.pathExists(auditLogPath)) {
       const auditLog = await fs.readFile(auditLogPath, "utf-8");
@@ -1555,12 +1794,6 @@ program
   .command("update-ecosystem")
   .description("Regenerate the PM2 ecosystem file and reload PM2")
   .action(async () => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     await updatePm2EcosystemFile();
     await reloadPm2();
 
@@ -1571,11 +1804,6 @@ program
   .command("reset <name>")
   .description("Reset a PocketBase instance (delete all data and optionally create a new admin account)")
   .action(async (name) => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-      process.exit(1);
-    }
-
     const config = await getInstancesConfig();
     if (!config.instances[name]) {
       console.error(chalk.red(`Instance "${name}" not found.`));
@@ -1677,11 +1905,6 @@ program
   .command("reset-admin <name>")
   .description("Reset the admin password for a PocketBase instance")
   .action(async (name) => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-      process.exit(1);
-    }
-
     const config = await getInstancesConfig();
     if (!config.instances[name]) {
       console.error(chalk.red(`Instance "${name}" not found.`));
@@ -1728,15 +1951,68 @@ program
   });
 
 program
+  .command("renew-certificates [instanceName]")
+  .description("Renew SSL certificates using Certbot. Renews all due certs, or a specific instance's cert.")
+  .option("-f, --force", "Force renewal even if the certificate is not yet due for expiry.")
+  .action(async (instanceName, options) => {
+    if (!shell.which("certbot")) {
+      console.error(chalk.red("Certbot command not found. Please install Certbot first."));
+
+      return;
+    }
+
+    let commandToRun;
+    let successMessage;
+
+    const targetInstanceName = instanceName && instanceName.toLowerCase() !== "all" ? instanceName : null;
+
+    if (targetInstanceName) {
+      const config = await getInstancesConfig();
+
+      const instance = config.instances[targetInstanceName];
+      if (!instance || !instance.useHttps) {
+        console.error(chalk.red(`Instance "${targetInstanceName}" not found or does not use HTTPS.`));
+
+        return;
+      }
+
+      const domain = instance.domain;
+
+      commandToRun = `sudo certbot renew --cert-name ${domain}`;
+
+      if (options.force) {
+        commandToRun += " --force-renewal";
+      }
+
+      successMessage = `Attempted certificate renewal for ${domain}.`;
+    } else {
+      commandToRun = "sudo certbot renew";
+
+      if (options.force) {
+        commandToRun += " --force-renewal";
+      }
+
+      successMessage = "Attempted renewal for all managed certificates.";
+    }
+
+    try {
+      console.log(chalk.blue(`Executing: ${commandToRun}`));
+
+      runCommand(commandToRun, "Certbot renewal command failed.");
+
+      console.log(chalk.green(successMessage));
+      console.log(chalk.blue("Reloading Nginx to apply any changes..."));
+
+      await reloadNginx();
+    } catch (error) {
+      console.error(chalk.red(`Certificate renewal process failed: ${error.message}`));
+    }
+  });
+
+program
   .command("update-pb-manager")
   .description("Update pb-manager itself from the latest version on GitHub")
   .action(async () => {
-    if (process.geteuid && process.geteuid() !== 0) {
-      console.error(chalk.red("You must run this script as root or with sudo."));
-
-      process.exit(1);
-    }
-
     const GITHUB_USER = "devAlphaSystem";
     const GITHUB_REPO = "Alpha-System-PBManager";
     const GITHUB_BRANCH = "main";
@@ -1787,32 +2063,22 @@ program
     process.exit(0);
   });
 
-async function appendAuditLog(command, details) {
-  const auditLogPath = path.join(CONFIG_DIR, "audit.log");
-  const logEntry = `${new Date().toISOString()} - Command: ${command}; Details: ${details}\n`;
+program.hook("preAction", async (thisCommand, actionCommand) => {
+  currentCommandNameForAudit = actionCommand.name();
+  currentCommandArgsForAudit = process.argv.slice(3).join(" ");
 
-  try {
-    await fs.ensureDir(CONFIG_DIR);
-    await fs.appendFile(auditLogPath, logEntry);
-  } catch (e) {
-    if (completeLogging) {
-      console.log(chalk.red(`Failed to append to audit log: ${e.message}`));
-    }
-  }
-}
-
-program.hook("preAction", async (thisCommand) => {
   try {
     await fs.ensureDir(CONFIG_DIR);
 
     const cliConfig = await getCliConfig();
-    const cachedLatestVersion = await getCachedLatestVersion();
+    completeLogging = cliConfig.completeLogging || false;
 
+    const cachedLatestVersion = await getCachedLatestVersion();
     if (cliConfig.defaultPocketBaseVersion && cachedLatestVersion && cliConfig.defaultPocketBaseVersion !== cachedLatestVersion) {
       console.log(chalk.yellow(`New version of PocketBase has been released: v${cachedLatestVersion}, use 'pb-manager update-pb' to update it`));
     }
 
-    await appendAuditLog(thisCommand.name(), process.argv.slice(2).join(" "));
+    await appendAuditLog(currentCommandNameForAudit, currentCommandArgsForAudit);
   } catch (e) {
     if (completeLogging) {
       console.log(chalk.red(`Error in preAction hook: ${e.message}`));
@@ -1824,37 +2090,39 @@ program.helpInformation = () => `
   PocketBase Manager (pb-manager)
   A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
 
-  Version: 0.2.4
+  Version: 0.2.5
 
   Usage:
     sudo pb-manager <command> [options]
 
   Main Commands:
-    dashboard             Show interactive dashboard for all PocketBase instances
-    add | create          Register a new PocketBase instance
-    list [--json]         List all managed PocketBase instances
-    remove <name>         Remove a PocketBase instance
-    reset <name>          Reset a PocketBase instance (delete all data and optionally create a new admin account)
-    reset-admin <name>    Reset the admin password for a PocketBase instance
+    dashboard                       Show interactive dashboard for all PocketBase instances
+    add | create                    Register a new PocketBase instance
+    clone <sourceName> <newName>    Clone an existing instance's data and config to a new one
+    list [--json]                   List all managed PocketBase instances
+    remove <name>                   Remove a PocketBase instance
+    reset <name>                    Reset a PocketBase instance (delete all data and optionally create a new admin account)
+    reset-admin <name>              Reset the admin password for a PocketBase instance
 
   Instance Management:
-    start <name>          Start a specific PocketBase instance via PM2
-    stop <name>           Stop a specific PocketBase instance via PM2
-    restart <name>        Restart a specific PocketBase instance via PM2
-    logs <name>           Show logs for a specific PocketBase instance from PM2
+    start <name>                    Start a specific PocketBase instance via PM2
+    stop <name>                     Stop a specific PocketBase instance via PM2
+    restart <name>                  Restart a specific PocketBase instance via PM2
+    logs <name>                     Show logs for a specific PocketBase instance from PM2
 
   Setup & Configuration:
-    setup [--version]     Initial setup: creates directories and downloads PocketBase
-    configure             Set or view CLI configurations (default Certbot email, PB version, logging)
+    setup [--version]               Initial setup: creates directories and downloads PocketBase
+    configure                       Set or view CLI configurations (default Certbot email, PB version, logging)
 
-  Updates:
-    update-pocketbase     Update the PocketBase executable and restart all instances
-    update-ecosystem      Regenerate the PM2 ecosystem file and reload PM2
-    update-pb-manager     Update the pb-manager CLI from GitHub
+  Updates & Maintenance:
+    renew-certificates [name|all]   Renew SSL certificates using Certbot (use --force to force renewal)
+    update-pocketbase               Update the PocketBase executable and restart all instances
+    update-ecosystem                Regenerate the PM2 ecosystem file and reload PM2
+    update-pb-manager               Update the pb-manager CLI from GitHub
 
   Other:
-    audit                 Show the history of commands executed by this CLI
-    help [command]        Show help for a specific command
+    audit                           Show the history of commands executed by this CLI (includes errors)
+    help [command]                  Show help for a specific command
 
   Run all commands as root or with sudo.
 
@@ -1884,10 +2152,16 @@ async function main() {
   await program.parseAsync(process.argv);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error(chalk.red("An unexpected error occurred:"), err.message);
 
-  if (err.stack && (completeLogging || process.env.DEBUG)) {
+  await appendAuditLog(currentCommandNameForAudit, currentCommandArgsForAudit, err);
+
+  const cliConfig = await getCliConfig().catch(() => ({
+    completeLogging: false,
+  }));
+
+  if (err.stack && (cliConfig.completeLogging || process.env.DEBUG)) {
     console.error(err.stack);
   }
 
