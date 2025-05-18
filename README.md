@@ -4,6 +4,8 @@
 
 `pb-manager` is a command-line interface (CLI) tool designed to simplify the management of multiple PocketBase instances on a single Linux server. It automates setup, configuration, and ongoing maintenance tasks, including process management with PM2, reverse proxying with Nginx, SSL certificate handling with Certbot, and provides an interactive dashboard for instance monitoring.
 
+It supports Debian-based (like Ubuntu), RHEL-based (like Fedora, CentOS, Oracle Linux), and Arch-based Linux distributions by adapting Nginx configuration paths accordingly.
+
 ### Why pb-manager?
 
 Running multiple web applications, like PocketBase instances, on one server can become complex. Each instance needs:
@@ -20,7 +22,8 @@ Running multiple web applications, like PocketBase instances, on one server can 
 
 - Download and manage the PocketBase executable (uses the latest version by default, with fallback and override options).
 - Create and configure new PocketBase instances with isolated data.
-- Automatically generate secure, modern Nginx reverse proxy configurations (with optional HTTP/2, security headers, and configurable max body size).
+- **Clone** existing instances, including their data and configuration.
+- Automatically generate secure, modern Nginx reverse proxy configurations (with optional HTTP/2, security headers, and configurable max body size), adapting to different Linux distributions.
 - Integrate with PM2 for process management (start, stop, restart, logs, auto-restart on crash/boot).
 - Optionally, automate SSL certificate acquisition and renewal using Certbot for HTTPS.
 - Update the core PocketBase executable using its built-in update mechanism and restart instances.
@@ -34,7 +37,7 @@ Running multiple web applications, like PocketBase instances, on one server can 
 - Perform **DNS validation**: Before finalizing HTTPS configuration, validates that the domain's DNS A/AAAA records point to your server.
 - Provide **PocketBase version notification**: Notifies you (with a 24h cache) when a new PocketBase version is available, at the start of every command.
 - **Update itself**: Can fetch and install the latest version of `pb-manager` from GitHub.
-- Renew SSL certificates for all instances using Certbot, with options to force renewal.
+- Renew SSL certificates for all instances or specific ones using Certbot, with options to force renewal.
 
 ## How It Works
 
@@ -46,43 +49,49 @@ Running multiple web applications, like PocketBase instances, on one server can 
 4.  **Version Cache:** The latest fetched PocketBase version from GitHub is cached for 24 hours in `~/.pb-manager/version-cache.json` to reduce API calls.
 5.  **Data Isolation:** Each instance is given its own data directory under `~/.pb-manager/instances_data/`, ensuring that databases and files are kept separate.
 6.  **PM2:** For each instance, `pb-manager` generates an entry in a PM2 ecosystem file (`~/.pb-manager/ecosystem.config.js`). PM2 is then used to run, monitor, and manage the lifecycle of these PocketBase processes.
-7.  **Nginx:** When an instance is added, `pb-manager` generates a secure Nginx server block configuration file in `/etc/nginx/sites-available/` and creates a symbolic link in `/etc/nginx/sites-enabled/`. This configures Nginx to act as a reverse proxy, forwarding requests from a public domain to the instance's internal port.
+7.  **Nginx:** When an instance is added, `pb-manager` generates a secure Nginx server block configuration file.
+    - For Debian/Arch: in `/etc/nginx/sites-available/` and creates a symbolic link in `/etc/nginx/sites-enabled/`.
+    - For RHEL-based systems: in `/etc/nginx/conf.d/`.
+      This configures Nginx to act as a reverse proxy, forwarding requests from a public domain to the instance's internal port.
 8.  **Certbot:** If HTTPS is enabled for an instance, `pb-manager` can attempt to run Certbot to obtain and install a Let's Encrypt SSL certificate for the specified domain. Certbot will modify the Nginx configuration to enable HTTPS. `pb-manager` also ensures a `dhparam.pem` file exists for stronger SSL.
 9.  **Superuser Creation/Management:** When adding a new instance, `pb-manager` offers to create the initial PocketBase superuser (admin) account via the CLI, or guides you to do it via the web UI. It also provides a command to reset an admin's password.
 10. **Interactive Dashboard:** Uses `blessed` and `blessed-contrib` to render a terminal-based UI for real-time monitoring and management of instances.
 11. **Audit Log:** Every command run through `pb-manager` is recorded in an audit log (`~/.pb-manager/audit.log`) with a timestamp and details.
 12. **DNS Validation:** When adding an instance with HTTPS, `pb-manager` checks that the domain resolves and points to your server's public IP before proceeding with Certbot.
 13. **PocketBase Version Notification:** At the start of every command, `pb-manager` checks (using the version cache) if a new PocketBase version is available and notifies you.
+14. **Distro Detection:** Automatically detects if the system is Debian-based, RHEL-based, or Arch-based to use appropriate Nginx paths and Certbot commands.
 
 ## Prerequisites
 
-Before using `pb-manager`, ensure the following are installed and configured on your Linux server (primarily tested on Ubuntu/Debian):
+Before using `pb-manager`, ensure the following are installed and configured on your Linux server:
 
-1.  **Node.js and npm:** Node.js v18.x or newer is recommended. Required to run the `pb-manager.js` script and install its dependencies.
-    - Installation (if not present or older version): The automated installer handles this. Manually: `sudo apt update && sudo apt install nodejs npm` (check version after).
-2.  **PM2:** The process manager.
-    - Installation: `sudo npm install -g pm2`
-    - Setup for auto-boot: `sudo pm2 startup` (follow instructions) and `sudo pm2 save`.
-3.  **Nginx:** The web server/reverse proxy.
-    - Installation: `sudo apt update && sudo apt install nginx`
-    - Ensure it's running and enabled: `sudo systemctl start nginx && sudo systemctl enable nginx`.
-4.  **Certbot (with Nginx plugin):** For SSL certificate management.
-    - Installation: `sudo apt update && sudo apt install certbot python3-certbot-nginx`
-5.  **`sudo` access:** All `pb-manager` commands require root privileges.
-6.  **Firewall:** Ports 80 (HTTP) and 443 (HTTPS) must be open.
-    - Example with `ufw`: `sudo ufw allow 'Nginx Full'` or `sudo ufw allow 80/tcp && sudo ufw allow 443/tcp`, then `sudo ufw enable`.
-7.  **DNS Records:** For each domain/subdomain you intend to use, an A (and/or AAAA) record must point to your server's public IP address. This is crucial for Nginx and Certbot to function correctly. `pb-manager` will attempt to validate this.
-8.  **Essential tools:** `curl` and `git` (usually pre-installed or installed by the automated script). `openssl` (for `dhparam` generation).
+1.  **Supported Linux Distribution:** Debian-based (e.g., Ubuntu), RHEL-based (e.g., Fedora, CentOS, Oracle Linux), or Arch-based.
+2.  **Node.js and npm:** Node.js v18.x or newer is recommended. Required to run the `pb-manager.js` script and install its dependencies.
+3.  **PM2:** The process manager.
+4.  **Nginx:** The web server/reverse proxy.
+5.  **Certbot (with Nginx plugin):** For SSL certificate management.
+    - Debian/Ubuntu: `certbot`, `python3-certbot-nginx`
+    - RHEL/Fedora: `certbot`, `python3-certbot-nginx` (often via EPEL repository)
+    - Arch: `certbot`, `certbot-nginx`
+6.  **Essential Tools:** `curl`, `git`, `openssl`.
+7.  **`sudo` access:** All `pb-manager` commands require root privileges.
+8.  **Firewall:** Ports 80 (HTTP) and 443 (HTTPS) must be open. The automated installer attempts to configure `ufw` or `firewalld`.
+9.  **DNS Records:** For each domain/subdomain you intend to use, an A (and/or AAAA) record must point to your server's public IP address. This is crucial for Nginx and Certbot to function correctly. `pb-manager` will attempt to validate this.
 
 ## Installation
 
 ### Automated Installation (Recommended)
 
-The provided shell script installs `pb-manager`, all its dependencies, and configures necessary services on Debian-based systems (like Ubuntu).
+The provided shell script installs `pb-manager`, all its dependencies, and configures necessary services on supported Linux distributions.
 
-1.  Ensure `curl` and `git` are installed:
+1.  Ensure `curl` and `git` are installed (the script will try to install them, but it's good to have them):
     ```bash
+    # For Debian/Ubuntu
     sudo apt update && sudo apt upgrade -y && sudo apt install -y curl git sudo
+    # For RHEL/Fedora
+    # sudo dnf install -y curl git sudo
+    # For Arch
+    # sudo pacman -Syu --noconfirm curl git sudo
     ```
 2.  Run the installer:
     ```bash
@@ -91,44 +100,46 @@ The provided shell script installs `pb-manager`, all its dependencies, and confi
 
 The installer will:
 
-- Check for a Debian-based system.
+- Check for a supported distribution (Debian, RHEL, Arch).
 - Update package lists.
-- Install/verify Node.js (v18.x), npm, PM2, Nginx, and Certbot.
-- Configure PM2 to start on boot.
+- Install/verify Node.js (v18.x), npm, PM2, Nginx, Certbot, and other essential tools.
+- Configure PM2 to start on boot (using `systemd`).
+- **WSL2 Note:** If running on WSL2 without `systemd` enabled, the script will prompt to help configure it in `/etc/wsl.conf`. This requires a WSL shutdown and restart.
 - Download `pb-manager.js` to `/opt/pb-manager/`.
 - Install Node.js dependencies for `pb-manager` in `/opt/pb-manager/`.
 - Create a symlink `pb-manager` at `/usr/local/bin/pb-manager`.
-- Attempt to configure UFW for Nginx traffic.
+- Attempt to configure `ufw` or `firewalld` for Nginx traffic (HTTP/HTTPS).
+- Optionally run `pb-manager setup` to download PocketBase binaries.
 
 ### Manual Installation
 
-1.  **Create a directory for the script (e.g., in your home directory or `/opt` for system-wide):**
+1.  **Ensure all prerequisites listed above are installed manually.**
+2.  **Create a directory for the script:**
     ```bash
-    sudo mkdir -p /opt/pb-manager # Or a path like ~/pocketbase-manager
+    sudo mkdir -p /opt/pb-manager
     cd /opt/pb-manager
     ```
-2.  **Download the `pb-manager.js` script** into this directory from the repository.
+3.  **Download the `pb-manager.js` script:**
     ```bash
     sudo curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManager/main/pb-manager.js -o pb-manager.js
     ```
-3.  **Initialize npm and install dependencies:**
+4.  **Initialize npm and install dependencies:**
     ```bash
     sudo npm init -y
     sudo npm install commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs blessed blessed-contrib cli-table3 pretty-bytes@5.6.0
     ```
-4.  **Make the script executable:**
+5.  **Make the script executable:**
     ```bash
     sudo chmod +x pb-manager.js
     ```
-5.  **(Optional but Recommended) Create a symlink for global access:**
+6.  **(Recommended) Create a symlink for global access:**
     ```bash
     sudo ln -sfn /opt/pb-manager/pb-manager.js /usr/local/bin/pb-manager
     ```
-    (Adjust the source path if you installed it elsewhere).
 
 ## Configuration Directory
 
-`pb-manager` stores all its configuration files, the PocketBase binary, instance data, and logs within the `~/.pb-manager/` directory (relative to the home directory of the user running the script, typically root if using `sudo`).
+`pb-manager` stores all its configuration files, the PocketBase binary, instance data, and logs within the `~/.pb-manager/` directory (relative to the home directory of the user running the script, typically `/root/.pb-manager` when using `sudo`).
 
 - `~/.pb-manager/cli-config.json`: Global settings for the `pb-manager` tool (default Certbot email, default PB version, logging preference).
 - `~/.pb-manager/instances.json`: Configuration for each managed PocketBase instance.
@@ -144,7 +155,7 @@ The installer will:
   PocketBase Manager (pb-manager)
   A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
 
-  Version: 0.2.5
+  Version: 0.3.0
 
   Usage:
     sudo pb-manager <command> [options]
@@ -154,8 +165,8 @@ The installer will:
     add | create                    Register a new PocketBase instance
     clone <sourceName> <newName>    Clone an existing instance's data and config to a new one
     list [--json]                   List all managed PocketBase instances
-    remove <name>                   Remove a PocketBase instance
-    reset <name>                    Reset a PocketBase instance (delete all data and optionally create a new admin account)
+    remove <name>                   Remove a PocketBase instance (prompts for data deletion)
+    reset <name>                    Reset a PocketBase instance (delete all data, re-confirm needed)
     reset-admin <name>              Reset the admin password for a PocketBase instance
 
   Instance Management:
@@ -192,7 +203,7 @@ A notification about new PocketBase versions (if available) and audit logging oc
 **Features:**
 
 - Real-time view of: Instance Name, Domain, Port, PM2 Status, HTTP Health Check, SSL Status, CPU/Memory usage, Uptime, Data Directory Size.
-- **Hotkeys:** `q` (Quit), `r` (Refresh), `l` (Logs), `s` (Start/Stop), `d` (Delete instance - will prompt for confirmation via `pb-manager remove`).
+- **Hotkeys:** `q` (Quit), `r` (Refresh), `l` (Logs), `s` (Start/Stop), `d` (Delete instance - will prompt for confirmation via `pb-manager remove <name>`).
 
 #### `add` (alias: `create`)
 
@@ -231,7 +242,7 @@ A notification about new PocketBase versions (if available) and audit logging oc
 **Arguments:**
 
 - `<instance-name>`: The name of the instance to remove.
-  **Details:** Confirms action, stops/deletes PM2 process, removes Nginx config. **Data directory is NOT deleted automatically.**
+  **Details:** Confirms action, stops/deletes PM2 process, removes Nginx config. **Prompts for optional deletion of the data directory.**
 
 #### `reset <name>`
 
@@ -241,7 +252,7 @@ A notification about new PocketBase versions (if available) and audit logging oc
 
 - `<instance-name>`: The name of the instance to reset.
   **Details:**
-- Asks for explicit confirmation.
+- Asks for explicit confirmation (typing the instance name).
 - Stops and removes the instance's PM2 process.
 - **Deletes the entire data directory** for the instance (e.g., `~/.pb-manager/instances_data/<instance-name>/`).
 - Recreates an empty data directory.
@@ -360,6 +371,7 @@ If you need to reset an existing admin password, you can use the `pb-manager res
 
 ## Nginx Configuration Features
 
+- **Distro Aware:** Adapts Nginx configuration paths for Debian-based, RHEL-based, and Arch-based systems.
 - **HTTP/2:** Optionally enabled per instance for improved performance.
 - **Security Headers:** Includes `Strict-Transport-Security`, `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection` by default.
 - **Upload Limit:** Optionally set `client_max_body_size 20M` per instance.
@@ -397,7 +409,7 @@ While `pb-manager` aims to automate and simplify, be aware of:
 - **Permissions:** Ensure correct file system permissions. Running with `sudo` generally handles this.
 - **PocketBase Updates:** Breaking changes in PocketBase itself could affect instances. Review release notes.
 - **Data Loss Risk:**
-  - The `remove` command doesn't delete data by default, but **always back up your data independently.**
+  - The `remove` command prompts for data deletion, but **always back up your data independently.**
   - The `reset <name>` command is **highly destructive** and will permanently delete all data for the specified instance. Use with extreme caution.
   - The `clone <sourceName> <newName>` command copies data. Ensure the source data is what you intend to replicate.
 - **Script Bugs:** The tool may have bugs. Test in non-critical environments first.

@@ -15,6 +15,62 @@ const blessed = require("blessed");
 const contrib = require("blessed-contrib");
 const dns = require("node:dns/promises");
 
+let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
+let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
+let NGINX_DISTRO_MODE = "debian";
+
+function detectDistro() {
+  if (shell.which("apt-get")) {
+    NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
+    NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
+    NGINX_DISTRO_MODE = "debian";
+
+    if (!fs.existsSync(NGINX_SITES_AVAILABLE)) {
+      shell.exec(`sudo mkdir -p ${NGINX_SITES_AVAILABLE}`, { silent: true });
+    }
+
+    if (!fs.existsSync(NGINX_SITES_ENABLED)) {
+      shell.exec(`sudo mkdir -p ${NGINX_SITES_ENABLED}`, { silent: true });
+    }
+
+    return "apt";
+  }
+
+  if (shell.which("dnf")) {
+    NGINX_SITES_AVAILABLE = "/etc/nginx/conf.d";
+    NGINX_SITES_ENABLED = "/etc/nginx/conf.d";
+    NGINX_DISTRO_MODE = "rhel";
+
+    if (!fs.existsSync(NGINX_SITES_AVAILABLE)) {
+      shell.exec(`sudo mkdir -p ${NGINX_SITES_AVAILABLE}`, { silent: true });
+    }
+
+    if (!fs.existsSync(NGINX_SITES_ENABLED)) {
+      shell.exec(`sudo mkdir -p ${NGINX_SITES_ENABLED}`, { silent: true });
+    }
+
+    return "dnf";
+  }
+
+  if (shell.which("pacman")) {
+    NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
+    NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
+    NGINX_DISTRO_MODE = "arch";
+
+    if (!fs.existsSync(NGINX_SITES_AVAILABLE)) {
+      shell.exec(`sudo mkdir -p ${NGINX_SITES_AVAILABLE}`, { silent: true });
+    }
+
+    if (!fs.existsSync(NGINX_SITES_ENABLED)) {
+      shell.exec(`sudo mkdir -p ${NGINX_SITES_ENABLED}`, { silent: true });
+    }
+
+    return "pacman";
+  }
+
+  return null;
+}
+
 const CONFIG_DIR = path.join(process.env.HOME || os.homedir(), ".pb-manager");
 const CLI_CONFIG_PATH = path.join(CONFIG_DIR, "cli-config.json");
 const INSTANCES_CONFIG_PATH = path.join(CONFIG_DIR, "instances.json");
@@ -22,9 +78,6 @@ const POCKETBASE_BIN_DIR = path.join(CONFIG_DIR, "bin");
 const POCKETBASE_EXEC_PATH = path.join(POCKETBASE_BIN_DIR, "pocketbase");
 const INSTANCES_DATA_BASE_DIR = path.join(CONFIG_DIR, "instances_data");
 const PM2_ECOSYSTEM_FILE = path.join(CONFIG_DIR, "ecosystem.config.js");
-
-const NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
-const NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 const VERSION_CACHE_PATH = path.join(CONFIG_DIR, "version-cache.json");
 
 let completeLogging = false;
@@ -61,7 +114,13 @@ async function appendAuditLog(command, details, error = null) {
 
 async function validateDnsRecords(domain) {
   try {
-    const publicIpRes = await axios.get("https://api.ipify.org?format=json");
+    const publicIpRes = await axios.get("https://api.ipify.org?format=json", { timeout: 5000 }).catch(() => null);
+    if (!publicIpRes || !publicIpRes.data || !publicIpRes.data.ip) {
+      console.log(chalk.yellow("Could not fetch server's public IP. Skipping DNS validation."));
+
+      return true;
+    }
+
     const serverIp = publicIpRes.data.ip;
 
     let domainResolved = false;
@@ -79,13 +138,17 @@ async function validateDnsRecords(domain) {
           break;
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      if (completeLogging) {
+        console.log(chalk.blue(`No A records found or error resolving A records for ${domain}: ${e.message}`));
+      }
+    }
 
     if (!pointsToServer) {
       try {
         const aaaaRecords = await dns.resolve6(domain);
 
-        domainResolved = true;
+        domainResolved = domainResolved || aaaaRecords.length > 0;
 
         for (let i = 0; i < aaaaRecords.length; i++) {
           if (aaaaRecords[i] === serverIp) {
@@ -94,28 +157,26 @@ async function validateDnsRecords(domain) {
             break;
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        if (completeLogging) {
+          console.log(chalk.blue(`No AAAA records found or error resolving AAAA records for ${domain}: ${e.message}`));
+        }
+      }
     }
 
     if (!domainResolved) {
-      if (completeLogging) {
-        console.log(chalk.red(`Domain ${domain} could not be resolved. It might not exist.`));
-      }
+      console.log(chalk.red(`Domain ${domain} could not be resolved. It might not exist or DNS propagation is pending.`));
 
       return false;
     }
 
     if (!pointsToServer) {
-      if (completeLogging) {
-        console.log(chalk.yellow(`Domain ${domain} exists but doesn't point to this server (${serverIp}).`));
-      }
+      console.log(chalk.yellow(`Domain ${domain} exists but does not seem to point to this server's IP (${serverIp}). Please check your DNS A/AAAA records.`));
     }
 
     return pointsToServer;
   } catch (e) {
-    if (completeLogging) {
-      console.log(chalk.red(`Error validating DNS records for ${domain}: ${e.message}`));
-    }
+    console.log(chalk.red(`Error validating DNS records for ${domain}: ${e.message}`));
 
     return false;
   }
@@ -158,7 +219,7 @@ async function getLatestPocketBaseVersion(forceRefresh = false) {
   }
 
   try {
-    const res = await axios.get("https://api.github.com/repos/pocketbase/pocketbase/releases/latest", { headers: { "User-Agent": "pb-manager" } });
+    const res = await axios.get("https://api.github.com/repos/pocketbase/pocketbase/releases/latest", { headers: { "User-Agent": "pb-manager" }, timeout: 5000 });
     if (res.data?.tag_name) {
       _latestPocketBaseVersionCache = res.data.tag_name.replace(/^v/, "");
       return _latestPocketBaseVersionCache;
@@ -222,6 +283,7 @@ async function ensureBaseSetup() {
   }
 
   const currentCliConfig = await getCliConfig();
+
   await saveCliConfig(currentCliConfig);
 }
 
@@ -246,6 +308,21 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
   }
 
   if (await fs.pathExists(POCKETBASE_EXEC_PATH)) {
+    const { confirmOverwrite } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmOverwrite",
+        message: `PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Do you want to remove it and download version ${versionToDownload}?`,
+        default: false,
+      },
+    ]);
+
+    if (!confirmOverwrite) {
+      console.log(chalk.yellow("Download cancelled by user."));
+
+      return;
+    }
+
     if (completeLogging) {
       console.log(chalk.yellow(`Removing existing PocketBase executable at ${POCKETBASE_EXEC_PATH} to download version ${versionToDownload}...`));
     }
@@ -310,7 +387,7 @@ function runCommand(command, errorMessage, ignoreError = false, options = {}) {
   if (result.code !== 0 && !ignoreError) {
     console.error(chalk.red(errorMessage || `Error executing command: ${command}`));
 
-    if (completeLogging) {
+    if (completeLogging || !options.silent) {
       console.error(chalk.red(result.stderr));
     }
 
@@ -428,22 +505,33 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     `;
   }
 
-  const nginxConfPath = path.join(NGINX_SITES_AVAILABLE, instanceName);
-  const nginxEnabledPath = path.join(NGINX_SITES_ENABLED, instanceName);
+  let nginxConfPath;
+  let nginxEnabledPath;
+
+  if (NGINX_DISTRO_MODE === "rhel") {
+    nginxConfPath = path.join(NGINX_SITES_AVAILABLE, `${instanceName}.conf`);
+    nginxEnabledPath = nginxConfPath;
+  } else {
+    nginxConfPath = path.join(NGINX_SITES_AVAILABLE, instanceName);
+    nginxEnabledPath = path.join(NGINX_SITES_ENABLED, instanceName);
+  }
 
   if (completeLogging) {
     console.log(chalk.blue(`Generating Nginx config for ${instanceName} at ${nginxConfPath}`));
-    console.log(chalk.blue(`Creating Nginx symlink: ${nginxEnabledPath}`));
   }
 
   await fs.writeFile(nginxConfPath, configContent.trim());
 
-  try {
-    runCommand(`sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`);
-  } catch (error) {
+  if (NGINX_DISTRO_MODE !== "rhel") {
     if (completeLogging) {
-      console.error(chalk.red("Failed to create symlink. Try running with sudo or create it manually."));
-      console.log(`Manually run: sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`);
+      console.log(chalk.blue(`Creating Nginx symlink: ${nginxEnabledPath}`));
+    }
+
+    try {
+      runCommand(`sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`);
+    } catch (error) {
+      console.error(chalk.red("Failed to create Nginx symlink. Please try running this command with sudo, or create the symlink manually."));
+      console.log(chalk.yellow(`Manually run: sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`));
     }
   }
 }
@@ -460,11 +548,41 @@ async function reloadNginx() {
       console.log(chalk.blue("Reloading Nginx..."));
     }
 
-    runCommand("sudo systemctl reload nginx");
+    let reloaded = false;
+
+    if (shell.which("systemctl")) {
+      try {
+        runCommand("sudo systemctl reload nginx");
+
+        reloaded = true;
+      } catch (e) {}
+    }
+
+    if (!reloaded && shell.which("service")) {
+      try {
+        runCommand("sudo service nginx reload");
+
+        reloaded = true;
+      } catch (e) {}
+    }
+
+    if (!reloaded) {
+      try {
+        runCommand("sudo nginx -s reload");
+
+        reloaded = true;
+      } catch (e) {}
+    }
+
+    if (!reloaded) {
+      throw new Error("Could not reload Nginx with systemctl, service, or nginx -s reload.");
+    }
 
     console.log(chalk.green("Nginx reloaded successfully."));
   } catch (error) {
     console.error(chalk.red("Nginx test failed or reload failed. Please check Nginx configuration."));
+    console.log(chalk.yellow("You can try to diagnose Nginx issues by running: sudo nginx -t"));
+    console.log(chalk.yellow("Check Nginx error logs, typically found in /var/log/nginx/error.log"));
 
     throw error;
   }
@@ -510,7 +628,28 @@ async function runCertbot(domain, email) {
     runCommand("sudo mkdir -p /var/www/html", "Creating /var/www/html for Certbot", true);
   } catch (e) {}
 
-  const certbotCommand = `sudo certbot --nginx -d ${domain} --non-interactive --agree-tos -m "${email}" --redirect`;
+  let certbotCommand;
+
+  if (NGINX_DISTRO_MODE === "rhel") {
+    certbotCommand = `sudo certbot --nginx -d ${domain} --non-interactive --agree-tos -m "${email}" --redirect --nginx-server-root /etc/nginx/`;
+  } else {
+    certbotCommand = `sudo certbot --nginx -d ${domain} --non-interactive --agree-tos -m "${email}" --redirect`;
+  }
+
+  const { confirmCertbotRun } = await inquirer.prompt([
+    {
+      type: "confirm",
+      name: "confirmCertbotRun",
+      message: `Ready to run Certbot for domain ${domain} with email ${email}. Command: ${certbotCommand}. Proceed?`,
+      default: true,
+    },
+  ]);
+
+  if (!confirmCertbotRun) {
+    console.log(chalk.yellow("Certbot execution cancelled by user."));
+
+    return false;
+  }
 
   try {
     runCommand(certbotCommand, "Certbot command failed.");
@@ -522,6 +661,7 @@ async function runCertbot(domain, email) {
     return true;
   } catch (error) {
     console.error(chalk.red(`Certbot failed for ${domain}. Check Certbot logs.`));
+    console.log(chalk.yellow("You can try running Certbot manually or check logs in /var/log/letsencrypt/"));
 
     return false;
   }
@@ -551,9 +691,9 @@ async function getInstanceUsageAnalytics(instances) {
 
     let pm2Proc;
 
-    for (const proc of pm2List) {
-      if (proc.name === `pb-${name}`) {
-        pm2Proc = proc;
+    for (let i = 0; i < pm2List.length; i++) {
+      if (pm2List[i].name === `pb-${name}`) {
+        pm2Proc = pm2List[i];
         break;
       }
     }
@@ -603,8 +743,8 @@ async function getDirectorySize(dir) {
   let total = 0;
 
   const files = await fs.readdir(dir);
-  for (const file of files) {
-    const filePath = path.join(dir, file);
+  for (let i = 0; i < files.length; i++) {
+    const filePath = path.join(dir, files[i]);
     const stat = await fs.stat(filePath);
     if (stat.isDirectory()) {
       total += await getDirectorySize(filePath);
@@ -718,7 +858,8 @@ async function showDashboard() {
 
     const data = [];
 
-    for (const u of usage) {
+    for (let i = 0; i < usage.length; i++) {
+      const u = usage[i];
       data.push([truncateText(u.name, 25), truncateText(u.domain, 25), u.port, u.status, u.httpStatus, u.ssl, `${u.cpu}%`, prettyBytes(u.mem), formatUptime(u.uptime), prettyBytes(u.dataSize)]);
     }
 
@@ -808,7 +949,7 @@ async function showDashboard() {
 
       clearInterval(interval);
 
-      shell.exec(`pb-manager remove ${name}`);
+      console.log(chalk.yellow(`To delete instance "${name}", please run: pb-manager remove ${name}`));
 
       process.exit(0);
     }
@@ -938,6 +1079,7 @@ program
     await downloadPocketBaseIfNotExists(options.version);
 
     console.log(chalk.bold.green("Setup complete!"));
+    console.log(chalk.blue("You can now add your first PocketBase instance using: sudo pb-manager add"));
   });
 
 program
@@ -1048,9 +1190,22 @@ program
     if (httpsAnswers.useHttps) {
       const dnsValid = await validateDnsRecords(initialAnswers.domain);
       if (!dnsValid) {
-        console.error(chalk.red(`DNS validation failed for domain ${initialAnswers.domain} - DNS records do not point to this server.`));
+        const { proceedAnyway } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "proceedAnyway",
+            message: chalk.yellow(`DNS validation failed for ${initialAnswers.domain}. Certbot will likely fail. Do you want to proceed with the setup (you might need to fix DNS and run Certbot manually later, or use HTTP only)?`),
+            default: false,
+          },
+        ]);
 
-        return;
+        if (!proceedAnyway) {
+          console.log(chalk.yellow("Instance setup aborted by user due to DNS issues."));
+
+          return;
+        }
+
+        console.log(chalk.yellow("Proceeding with setup despite DNS validation issues. HTTPS/Certbot might fail."));
       }
 
       if (cliConfig.defaultCertbotEmail && httpsAnswers.useDefaultEmail) {
@@ -1105,20 +1260,36 @@ program
         if (certbotSuccess) {
           await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
         } else {
+          console.log(chalk.yellow("Certbot failed. Reverting Nginx to HTTP-only for now."));
+
           await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
         }
       } else {
         await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
 
-        console.log(chalk.yellow(`To obtain a certificate later, you can try running: sudo certbot --nginx -d ${initialAnswers.domain} -m ${emailToUseForCertbot}`));
+        console.log(chalk.yellow(`HTTPS Nginx config generated, but Certbot was not run automatically. To obtain a certificate, you can try running: sudo certbot --nginx -d ${initialAnswers.domain} -m ${emailToUseForCertbot}`));
       }
     } else {
       await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
     }
 
-    await reloadNginx();
-    await updatePm2EcosystemFile();
-    await reloadPm2();
+    const { confirmReloadServices } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmReloadServices",
+        message: "Nginx configuration has been updated. Do you want to reload Nginx and PM2 services now to apply changes and start the instance?",
+        default: true,
+      },
+    ]);
+
+    if (confirmReloadServices) {
+      await reloadNginx();
+      await updatePm2EcosystemFile();
+      await reloadPm2();
+    } else {
+      console.log(chalk.yellow("Skipped Nginx/PM2 reload. Please do it manually to start the instance and apply Nginx changes."));
+      console.log(chalk.yellow("You may need to run: sudo pb-manager update-ecosystem && sudo nginx -s reload"));
+    }
 
     let adminCreatedViaCli = false;
 
@@ -1171,7 +1342,7 @@ program
       }
     }
 
-    console.log(chalk.bold.green(`\nInstance "${initialAnswers.name}" added and started!`));
+    console.log(chalk.bold.green(`\nInstance "${initialAnswers.name}" added${confirmReloadServices ? " and started" : ""}!`));
 
     const protocol = httpsAnswers.useHttps && certbotSuccess ? "https" : "http";
     const publicBaseUrl = `${protocol}://${initialAnswers.domain}`;
@@ -1195,6 +1366,7 @@ program
     if (httpsAnswers.useHttps && !certbotSuccess && httpsAnswers.autoRunCertbot) {
       console.log(chalk.red("\nCertbot failed. The instance might only be available via HTTP or not at all if Nginx config expects SSL."));
       console.log(chalk.red("You might need to use the local URL for admin access or fix the Nginx/Certbot issue."));
+      console.log(chalk.red(`Try: sudo certbot --nginx -d ${initialAnswers.domain} -m ${emailToUseForCertbot}`));
     }
 
     console.log(chalk.yellow("\nOnce logged in, you can manage your collections and settings."));
@@ -1316,8 +1488,22 @@ program
     if (httpsAnswers.useHttps) {
       const dnsValid = await validateDnsRecords(cloneAnswers.domain);
       if (!dnsValid) {
-        console.error(chalk.red(`DNS validation failed for domain ${cloneAnswers.domain} - DNS records do not point to this server.`));
-        return;
+        const { proceedAnyway } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "proceedAnyway",
+            message: chalk.yellow(`DNS validation failed for ${cloneAnswers.domain}. Certbot will likely fail. Do you want to proceed with cloning (you might need to fix DNS and run Certbot manually later, or use HTTP only)?`),
+            default: false,
+          },
+        ]);
+
+        if (!proceedAnyway) {
+          console.log(chalk.yellow("Instance cloning aborted by user due to DNS issues."));
+
+          return;
+        }
+
+        console.log(chalk.yellow("Proceeding with cloning despite DNS validation issues. HTTPS/Certbot might fail."));
       }
 
       if (cliConfig.defaultCertbotEmail && httpsAnswers.useDefaultEmail) {
@@ -1385,20 +1571,35 @@ program
         if (certbotSuccess) {
           await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
         } else {
+          console.log(chalk.yellow("Certbot failed for cloned instance. Reverting Nginx to HTTP-only for now."));
+
           await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
         }
       } else {
         await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, true, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
 
-        console.log(chalk.yellow(`To obtain a certificate later, run: sudo certbot --nginx -d ${cloneAnswers.domain} -m ${emailToUseForCertbot}`));
+        console.log(chalk.yellow(`HTTPS Nginx config generated for cloned instance, but Certbot was not run. Run: sudo certbot --nginx -d ${cloneAnswers.domain} -m ${emailToUseForCertbot}`));
       }
     } else {
       await generateNginxConfig(nginxConfigParams.instanceName, nginxConfigParams.domain, nginxConfigParams.port, false, nginxConfigParams.useHttp2, nginxConfigParams.maxBody20Mb);
     }
 
-    await reloadNginx();
-    await updatePm2EcosystemFile();
-    await reloadPm2();
+    const { confirmReloadServicesClone } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmReloadServicesClone",
+        message: "Nginx configuration for the cloned instance has been updated. Do you want to reload Nginx and PM2 services now to apply changes and start the new instance?",
+        default: true,
+      },
+    ]);
+
+    if (confirmReloadServicesClone) {
+      await reloadNginx();
+      await updatePm2EcosystemFile();
+      await reloadPm2();
+    } else {
+      console.log(chalk.yellow("Skipped Nginx/PM2 reload for cloned instance. Please do it manually."));
+    }
 
     let adminCreatedViaCli = false;
 
@@ -1406,7 +1607,7 @@ program
       {
         type: "confirm",
         name: "createAdminCli",
-        message: `Data has been cloned. Do you want to create an *additional* superuser (admin) account for "${newName}" via CLI now?`,
+        message: `Data has been cloned. Do you want to create an *additional* superuser (admin) account for "${newName}" via CLI now? (Existing admins from "${sourceName}" are already cloned)`,
         default: false,
       },
     ]);
@@ -1450,7 +1651,7 @@ program
       }
     }
 
-    console.log(chalk.bold.green(`\nInstance "${newName}" cloned and started!`));
+    console.log(chalk.bold.green(`\nInstance "${newName}" cloned${confirmReloadServicesClone ? " and started" : ""}!`));
 
     const protocol = httpsAnswers.useHttps && certbotSuccess ? "https" : "http";
     const publicBaseUrl = `${protocol}://${cloneAnswers.domain}`;
@@ -1469,6 +1670,7 @@ program
 
     if (httpsAnswers.useHttps && !certbotSuccess && httpsAnswers.autoRunCertbot) {
       console.log(chalk.red(`\nCertbot failed for "${newName}". The instance might only be available via HTTP.`));
+      console.log(chalk.red(`Try: sudo certbot --nginx -d ${cloneAnswers.domain} -m ${emailToUseForCertbot}`));
     }
   });
 
@@ -1480,6 +1682,21 @@ program
 
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       console.error(chalk.red("PocketBase executable not found. Run 'setup' or 'configure' to set a version and download."));
+
+      return;
+    }
+
+    const { confirmUpdate } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmUpdate",
+        message: `This will run '${POCKETBASE_EXEC_PATH} update' to fetch the latest PocketBase binary and then restart ALL managed instances. Do you want to proceed?`,
+        default: true,
+      },
+    ]);
+
+    if (!confirmUpdate) {
+      console.log(chalk.yellow("PocketBase update cancelled by user."));
 
       return;
     }
@@ -1554,13 +1771,27 @@ program
       {
         type: "confirm",
         name: "confirm",
-        message: `Are you sure you want to remove instance "${name}"? This will stop it, remove its PM2 entry, and Nginx config. Data directory will NOT be deleted automatically.`,
+        message: `Are you sure you want to remove instance "${name}"? This will stop it, remove its PM2 entry, and Nginx config. Data directory will NOT be deleted automatically by this step.`,
         default: false,
       },
     ]);
 
     if (!confirm) {
       console.log(chalk.yellow("Removal cancelled."));
+      return;
+    }
+
+    const { confirmTyped } = await inquirer.prompt([
+      {
+        type: "input",
+        name: "confirmTyped",
+        message: `To confirm removal of instance "${name}", please type its name again:`,
+      },
+    ]);
+
+    if (confirmTyped !== name) {
+      console.log(chalk.yellow("Instance name did not match. Removal cancelled."));
+
       return;
     }
 
@@ -1577,14 +1808,15 @@ program
       }
     }
 
-    const nginxConfPath = path.join(NGINX_SITES_AVAILABLE, name);
-    const nginxEnabledPath = path.join(NGINX_SITES_ENABLED, name);
+    const nginxConfPathBase = NGINX_DISTRO_MODE === "rhel" ? `${name}.conf` : name;
+    const nginxConfPath = path.join(NGINX_SITES_AVAILABLE, nginxConfPathBase);
+    const nginxEnabledPath = NGINX_DISTRO_MODE === "rhel" ? nginxConfPath : path.join(NGINX_SITES_ENABLED, name);
 
     if (completeLogging) {
       console.log(chalk.blue(`Removing Nginx config for ${name}...`));
     }
 
-    if (await fs.pathExists(nginxEnabledPath)) {
+    if (NGINX_DISTRO_MODE !== "rhel" && (await fs.pathExists(nginxEnabledPath))) {
       try {
         runCommand(`sudo rm ${nginxEnabledPath}`);
       } catch (error) {
@@ -1604,6 +1836,8 @@ program
       }
     }
 
+    const instanceDataDir = config.instances[name].dataDir;
+
     delete config.instances[name];
 
     await saveInstancesConfig(config);
@@ -1619,7 +1853,39 @@ program
     await reloadNginx();
 
     console.log(chalk.bold.green(`Instance "${name}" removed.`));
-    console.log(chalk.yellow(`Data directory at ${path.join(INSTANCES_DATA_BASE_DIR, name)} was NOT deleted.`));
+    console.log(chalk.yellow(`Data directory at ${instanceDataDir} was NOT deleted.`));
+
+    const { confirmDeleteData } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmDeleteData",
+        message: `Do you want to permanently delete the data directory ${instanceDataDir} for the removed instance "${name}"? ${chalk.bold.red("THIS CANNOT BE UNDONE.")}`,
+        default: false,
+      },
+    ]);
+
+    if (confirmDeleteData) {
+      const { confirmTypedDeleteData } = await inquirer.prompt([
+        {
+          type: "input",
+          name: "confirmTypedDeleteData",
+          message: `To confirm PERMANENT DELETION of data for "${name}", type the instance name again:`,
+        },
+      ]);
+
+      if (confirmTypedDeleteData === name) {
+        try {
+          await fs.remove(instanceDataDir);
+
+          console.log(chalk.green(`Data directory ${instanceDataDir} deleted successfully.`));
+        } catch (err) {
+          console.error(chalk.red(`Failed to delete data directory ${instanceDataDir}: ${err.message}`));
+          console.log(chalk.yellow(`You may need to remove it manually: sudo rm -rf ${instanceDataDir}`));
+        }
+      } else {
+        console.log(chalk.yellow("Instance name did not match. Data directory NOT deleted."));
+      }
+    }
   });
 
 program
@@ -1817,13 +2083,28 @@ program
       {
         type: "confirm",
         name: "confirm",
-        message: `Are you sure you want to reset instance "${name}"? This will DELETE ALL DATA in ${dataDir} and start from zero. This cannot be undone.`,
+        message: `Are you sure you want to reset instance "${name}"? This will ${chalk.red.bold("DELETE ALL DATA")} in ${dataDir} and start from zero. This action cannot be undone.`,
         default: false,
       },
     ]);
 
     if (!confirm) {
       console.log(chalk.yellow("Reset cancelled."));
+
+      return;
+    }
+
+    const { confirmTyped } = await inquirer.prompt([
+      {
+        type: "input",
+        name: "confirmTyped",
+        message: `To confirm PERMANENT DELETION of all data for instance "${name}", please type its name again:`,
+      },
+    ]);
+
+    if (confirmTyped !== name) {
+      console.log(chalk.yellow("Instance name did not match. Reset cancelled."));
+
       return;
     }
 
@@ -1853,7 +2134,7 @@ program
       {
         type: "confirm",
         name: "createAdminCli",
-        message: "Do you want to create a new superuser (admin) account for this instance via CLI now?",
+        message: "Do you want to create a new superuser (admin) account for this reset instance via CLI now?",
         default: true,
       },
     ]);
@@ -1946,7 +2227,7 @@ program
 
       console.log(chalk.green(`Superuser (admin) password for ${adminCredentials.adminEmail} reset successfully!`));
     } catch (e) {
-      console.error(chalk.red("Superuser (admin) password reset via CLI failed. Please try resetting it via the web UI."));
+      console.error(chalk.red("Superuser (admin) password reset via CLI failed. The user may not exist or another error occurred."));
     }
   });
 
@@ -1995,6 +2276,21 @@ program
       successMessage = "Attempted renewal for all managed certificates.";
     }
 
+    const { confirmRenew } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmRenew",
+        message: `This will run Certbot to renew certificates. Command: ${commandToRun}. Proceed?`,
+        default: true,
+      },
+    ]);
+
+    if (!confirmRenew) {
+      console.log(chalk.yellow("Certificate renewal cancelled by user."));
+
+      return;
+    }
+
     try {
       console.log(chalk.blue(`Executing: ${commandToRun}`));
 
@@ -2006,6 +2302,7 @@ program
       await reloadNginx();
     } catch (error) {
       console.error(chalk.red(`Certificate renewal process failed: ${error.message}`));
+      console.log(chalk.yellow("Check Certbot logs in /var/log/letsencrypt/ for more details."));
     }
   });
 
@@ -2023,7 +2320,23 @@ program
       installPath = "/opt/pb-manager/pb-manager.js";
     }
 
-    console.log(chalk.cyan(`Updating pb-manager from ${SCRIPT_URL}`));
+    console.log(chalk.cyan(`Attempting to update pb-manager from ${SCRIPT_URL}`));
+
+    const { confirmUpdateSelf } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmUpdateSelf",
+        message: `This will download the latest version of pb-manager from GitHub and overwrite the current script at ${installPath}. Are you sure you want to proceed?`,
+        default: true,
+      },
+    ]);
+
+    if (!confirmUpdateSelf) {
+      console.log(chalk.yellow("pb-manager update cancelled by user."));
+
+      return;
+    }
+
     try {
       const response = await axios.get(SCRIPT_URL, { responseType: "text" });
       await fs.writeFile(installPath, response.data, { mode: 0o755 });
@@ -2039,8 +2352,8 @@ program
       {
         type: "confirm",
         name: "reinstall",
-        message: "Do you want to reinstall Node.js dependencies (npm install) in the install directory?",
-        default: false,
+        message: "Do you want to reinstall Node.js dependencies (npm install) in the install directory? This is recommended if the update included dependency changes.",
+        default: true,
       },
     ]);
 
@@ -2074,8 +2387,8 @@ program.hook("preAction", async (thisCommand, actionCommand) => {
     completeLogging = cliConfig.completeLogging || false;
 
     const cachedLatestVersion = await getCachedLatestVersion();
-    if (cliConfig.defaultPocketBaseVersion && cachedLatestVersion && cliConfig.defaultPocketBaseVersion !== cachedLatestVersion) {
-      console.log(chalk.yellow(`New version of PocketBase has been released: v${cachedLatestVersion}, use 'pb-manager update-pb' to update it`));
+    if (cliConfig.defaultPocketBaseVersion && cachedLatestVersion && cliConfig.defaultPocketBaseVersion !== cachedLatestVersion && actionCommand.name() !== "update-pocketbase" && actionCommand.name() !== "setup") {
+      console.log(chalk.yellow(`A new version of PocketBase (v${cachedLatestVersion}) has been released. Your default is v${cliConfig.defaultPocketBaseVersion}. Consider running 'pb-manager update-pocketbase'.`));
     }
 
     await appendAuditLog(currentCommandNameForAudit, currentCommandArgsForAudit);
@@ -2090,7 +2403,7 @@ program.helpInformation = () => `
   PocketBase Manager (pb-manager)
   A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
 
-  Version: 0.2.5
+  Version: 0.3.0
 
   Usage:
     sudo pb-manager <command> [options]
@@ -2100,8 +2413,8 @@ program.helpInformation = () => `
     add | create                    Register a new PocketBase instance
     clone <sourceName> <newName>    Clone an existing instance's data and config to a new one
     list [--json]                   List all managed PocketBase instances
-    remove <name>                   Remove a PocketBase instance
-    reset <name>                    Reset a PocketBase instance (delete all data and optionally create a new admin account)
+    remove <name>                   Remove a PocketBase instance (prompts for data deletion)
+    reset <name>                    Reset a PocketBase instance (delete all data, re-confirm needed)
     reset-admin <name>              Reset the admin password for a PocketBase instance
 
   Instance Management:
@@ -2125,27 +2438,32 @@ program.helpInformation = () => `
     help [command]                  Show help for a specific command
 
   Run all commands as root or with sudo.
-
+  
 `;
 
 async function main() {
   if (process.geteuid && process.geteuid() !== 0) {
-    console.error(chalk.red("You must run this script as root or with sudo."));
+    console.error(chalk.red("You must run this script as root or with sudo. This is required for managing system services and configurations."));
 
     process.exit(1);
   }
+
+  detectDistro();
 
   const cliConfig = await getCliConfig();
   completeLogging = cliConfig.completeLogging || false;
 
   if (!shell.which("pm2")) {
-    console.error(chalk.red("PM2 is not installed or not in PATH. Please install PM2: npm install -g pm2"));
+    console.error(chalk.red("PM2 is not installed or not in PATH. PM2 is essential for managing PocketBase instances."));
+    console.log(chalk.blue("Please install PM2 globally by running: npm install -g pm2"));
+    console.log(chalk.blue("Then, set it up to start on boot: sudo pm2 startup (and follow instructions)"));
 
     process.exit(1);
   }
 
   if (!shell.which("nginx")) {
-    console.warn(chalk.yellow("Nginx is not found. Nginx related commands might fail."));
+    console.warn(chalk.yellow("Nginx is not found in PATH. Nginx is required for reverse proxying and HTTPS."));
+    console.log(chalk.blue("Please install Nginx (e.g., sudo apt install nginx or sudo dnf install nginx)."));
   }
 
   await ensureBaseSetup();
