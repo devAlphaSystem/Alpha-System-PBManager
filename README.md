@@ -155,7 +155,7 @@ The installer will:
   PocketBase Manager (pb-manager)
   A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
 
-  Version: 0.3.0
+  Version: 0.3.1
 
   Usage:
     sudo pb-manager <command> [options]
@@ -170,9 +170,9 @@ The installer will:
     reset-admin <name>              Reset the admin password for a PocketBase instance
 
   Instance Management:
-    start <name>                    Start a specific PocketBase instance via PM2
-    stop <name>                     Stop a specific PocketBase instance via PM2
-    restart <name>                  Restart a specific PocketBase instance via PM2
+    start <name | all>              Start a specific PocketBase instance via PM2
+    stop <name | all>               Stop a specific PocketBase instance via PM2
+    restart <name | all>            Restart a specific PocketBase instance via PM2
     logs <name>                     Show logs for a specific PocketBase instance from PM2
 
   Setup & Configuration:
@@ -272,20 +272,20 @@ A notification about new PocketBase versions (if available) and audit logging oc
 
 ### Instance Management
 
-#### `start <name>`
+#### `start <name | all>`
 
-**Purpose:** Starts a specific PocketBase instance via PM2.
-**Usage:** `sudo pb-manager start <instance-name>`
+**Purpose:** Starts a specific or all PocketBase instances via PM2.
+**Usage:** `sudo pb-manager start <instance-name | all>`
 
-#### `stop <name>`
+#### `stop <name | all>`
 
-**Purpose:** Stops a specific PocketBase instance via PM2.
-**Usage:** `sudo pb-manager stop <instance-name>`
+**Purpose:** Stops a specific or all PocketBase instances via PM2.
+**Usage:** `sudo pb-manager stop <instance-name | all>`
 
-#### `restart <name>`
+#### `restart <name | all>`
 
-**Purpose:** Restarts a specific PocketBase instance via PM2.
-**Usage:** `sudo pb-manager restart <instance-name>`
+**Purpose:** Restarts a specific or all PocketBase instances via PM2.
+**Usage:** `sudo pb-manager restart <instance-name | all>`
 
 #### `logs <name>`
 

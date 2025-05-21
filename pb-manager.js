@@ -1994,41 +1994,119 @@ program
   });
 
 program
-  .command("start <name>")
-  .description("Start a specific PocketBase instance via PM2")
+  .command("start [name]")
+  .description("Start a specific PocketBase instance or all instances via PM2")
   .action(async (name) => {
-    try {
-      runCommand(`pm2 start pb-${name}`);
-
-      console.log(chalk.green(`Instance pb-${name} started.`));
-    } catch (e) {
-      console.error(chalk.red(`Failed to start instance pb-${name}. Is it configured?`));
+    if (name && name.toLowerCase() === "all") {
+      const config = await getInstancesConfig();
+      const instanceNames = Object.keys(config.instances);
+      if (instanceNames.length === 0) {
+        console.log(chalk.yellow("No instances configured to start."));
+        return;
+      }
+      console.log(chalk.blue("Starting all managed instances..."));
+      let allProcessedSuccessfully = true;
+      for (const instanceName of instanceNames) {
+        try {
+          runCommand(`pm2 start pb-${instanceName}`);
+          console.log(chalk.green(`Instance pb-${instanceName} started.`));
+        } catch (e) {
+          console.error(chalk.red(`Failed to start instance pb-${instanceName}.`));
+          allProcessedSuccessfully = false;
+        }
+      }
+      if (allProcessedSuccessfully) {
+        console.log(chalk.bold.green("All instances processed for starting."));
+      } else {
+        console.log(chalk.bold.yellow("Some instances may not have started correctly. Check PM2 logs."));
+      }
+    } else if (name) {
+      try {
+        runCommand(`pm2 start pb-${name}`);
+        console.log(chalk.green(`Instance pb-${name} started.`));
+      } catch (e) {
+        console.error(chalk.red(`Failed to start instance pb-${name}. Is it configured?`));
+      }
+    } else {
+      console.log(chalk.yellow("Please specify an instance name or 'all'. Usage: pb-manager start <name|all>"));
     }
   });
 
 program
-  .command("stop <name>")
-  .description("Stop a specific PocketBase instance via PM2")
+  .command("stop [name]")
+  .description("Stop a specific PocketBase instance or all instances via PM2")
   .action(async (name) => {
-    try {
-      runCommand(`pm2 stop pb-${name}`);
-
-      console.log(chalk.green(`Instance pb-${name} stopped.`));
-    } catch (e) {
-      console.error(chalk.red(`Failed to stop instance pb-${name}.`));
+    if (name && name.toLowerCase() === "all") {
+      const config = await getInstancesConfig();
+      const instanceNames = Object.keys(config.instances);
+      if (instanceNames.length === 0) {
+        console.log(chalk.yellow("No instances configured to stop."));
+        return;
+      }
+      console.log(chalk.blue("Stopping all managed instances..."));
+      let allProcessedSuccessfully = true;
+      for (const instanceName of instanceNames) {
+        try {
+          runCommand(`pm2 stop pb-${instanceName}`);
+          console.log(chalk.green(`Instance pb-${instanceName} stopped.`));
+        } catch (e) {
+          console.error(chalk.red(`Failed to stop instance pb-${instanceName}.`));
+          allProcessedSuccessfully = false;
+        }
+      }
+      if (allProcessedSuccessfully) {
+        console.log(chalk.bold.green("All instances processed for stopping."));
+      } else {
+        console.log(chalk.bold.yellow("Some instances may not have stopped correctly. Check PM2 logs."));
+      }
+    } else if (name) {
+      try {
+        runCommand(`pm2 stop pb-${name}`);
+        console.log(chalk.green(`Instance pb-${name} stopped.`));
+      } catch (e) {
+        console.error(chalk.red(`Failed to stop instance pb-${name}.`));
+      }
+    } else {
+      console.log(chalk.yellow("Please specify an instance name or 'all'. Usage: pb-manager stop <name|all>"));
     }
   });
 
 program
-  .command("restart <name>")
-  .description("Restart a specific PocketBase instance via PM2")
+  .command("restart [name]")
+  .description("Restart a specific PocketBase instance or all instances via PM2")
   .action(async (name) => {
-    try {
-      runCommand(`pm2 restart pb-${name}`);
-
-      console.log(chalk.green(`Instance pb-${name} restarted.`));
-    } catch (e) {
-      console.error(chalk.red(`Failed to restart instance pb-${name}.`));
+    if (name && name.toLowerCase() === "all") {
+      const config = await getInstancesConfig();
+      const instanceNames = Object.keys(config.instances);
+      if (instanceNames.length === 0) {
+        console.log(chalk.yellow("No instances configured to restart."));
+        return;
+      }
+      console.log(chalk.blue("Restarting all managed instances..."));
+      let allProcessedSuccessfully = true;
+      for (const instanceName of instanceNames) {
+        try {
+          runCommand(`pm2 restart pb-${instanceName}`);
+          console.log(chalk.green(`Instance pb-${instanceName} restarted.`));
+        } catch (e) {
+          console.error(chalk.red(`Failed to restart instance pb-${instanceName}.`));
+          allProcessedSuccessfully = false;
+        }
+      }
+      if (allProcessedSuccessfully) {
+        console.log(chalk.bold.green("All instances processed for restarting."));
+      } else {
+        console.log(chalk.bold.yellow("Some instances may not have restarted correctly. Check PM2 logs."));
+      }
+    } else if (name) {
+      try {
+        runCommand(`pm2 restart pb-${name}`);
+        console.log(chalk.green(`Instance pb-${name} restarted.`));
+      } catch (e) {
+        console.error(chalk.red(`Failed to restart instance pb-${name}.`));
+      }
+    } else {
+      console.log(chalk.yellow("Please specify an instance name or 'all'. Usage: pb-manager restart <name|all>"));
     }
   });
 
@@ -2403,7 +2481,7 @@ program.helpInformation = () => `
   PocketBase Manager (pb-manager)
   A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
 
-  Version: 0.3.0
+  Version: 0.3.1
 
   Usage:
     sudo pb-manager <command> [options]
@@ -2418,9 +2496,9 @@ program.helpInformation = () => `
     reset-admin <name>              Reset the admin password for a PocketBase instance
 
   Instance Management:
-    start <name>                    Start a specific PocketBase instance via PM2
-    stop <name>                     Stop a specific PocketBase instance via PM2
-    restart <name>                  Restart a specific PocketBase instance via PM2
+    start <name | all>              Start a specific PocketBase instance via PM2
+    stop <name | all>               Stop a specific PocketBase instance via PM2
+    restart <name | all>            Restart a specific PocketBase instance via PM2
     logs <name>                     Show logs for a specific PocketBase instance from PM2
 
   Setup & Configuration:
