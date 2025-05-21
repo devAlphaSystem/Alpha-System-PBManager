@@ -7,6 +7,7 @@ PB_MANAGER_GITHUB_REPO="Alpha-System-PBManager"
 PB_MANAGER_BRANCH="main"
 
 PB_MANAGER_SCRIPT_URL="https://raw.githubusercontent.com/${PB_MANAGER_GITHUB_USER}/${PB_MANAGER_GITHUB_REPO}/${PB_MANAGER_BRANCH}/pb-manager.js"
+PB_MANAGER_API_SCRIPT_URL="https://raw.githubusercontent.com/${PB_MANAGER_GITHUB_USER}/${PB_MANAGER_GITHUB_REPO}/${PB_MANAGER_BRANCH}/pb-manager-api.js"
 PB_MANAGER_INSTALL_DIR="/opt/pb-manager"
 PB_MANAGER_SYMLINK_PATH="/usr/local/bin/pb-manager"
 
@@ -207,7 +208,7 @@ else
     if [ "$PKG_MANAGER" = "apt" ]; then
       sudo ${INSTALL_CMD} certbot python3-certbot-nginx > /dev/null 2>&1 || sudo ${INSTALL_CMD} certbot certbot-nginx > /dev/null 2>&1 || error "Failed to install Certbot or its Nginx plugin."
     elif [ "$PKG_MANAGER" = "dnf" ]; then
-      sudo ${INSTALL_CMD} epel-release > /dev/null 2>&1 || true 
+      sudo ${INSTALL_CMD} epel-release > /dev/null 2>&1 || true
       sudo ${INSTALL_CMD} certbot python3-certbot-nginx > /dev/null 2>&1 || sudo ${INSTALL_CMD} certbot certbot-nginx > /dev/null 2>&1 || error "Failed to install Certbot or its Nginx plugin."
     elif [ "$PKG_MANAGER" = "pacman" ]; then
       sudo pacman -Syu --noconfirm > /dev/null 2>&1 || true
@@ -217,7 +218,7 @@ else
   fi
 fi
 
-info "Setting up pb-manager script..."
+info "Setting up pb-manager CLI script (pb-manager.js)..."
 if [ -f "${PB_MANAGER_INSTALL_DIR}/pb-manager.js" ]; then
   warn "${PB_MANAGER_INSTALL_DIR}/pb-manager.js already exists."
   read -p "Do you want to overwrite it with the latest version from the repository? [Y/n]: " overwrite_script
@@ -237,26 +238,26 @@ else
   success "pb-manager.js downloaded and made executable."
 fi
 
-info "Installing Node.js dependencies for pb-manager in ${PB_MANAGER_INSTALL_DIR}..."
+info "Installing Node.js dependencies for pb-manager CLI in ${PB_MANAGER_INSTALL_DIR}..."
 ORIGINAL_DIR=$(pwd)
 cd "${PB_MANAGER_INSTALL_DIR}" || error "Failed to change directory to ${PB_MANAGER_INSTALL_DIR}."
 
 PB_MANAGER_DEPS="commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs blessed blessed-contrib cli-table3 pretty-bytes@5.6.0"
-info "Required dependencies: ${PB_MANAGER_DEPS}"
-read -p "Do you want to install/update these dependencies now? [Y/n]: " install_deps
+info "Required CLI dependencies: ${PB_MANAGER_DEPS}"
+read -p "Do you want to install/update these CLI dependencies now? [Y/n]: " install_deps
 if [[ "$install_deps" =~ ^[Nn]$ ]]; then
-  warn "Skipping dependency installation. pb-manager might not work correctly."
+  warn "Skipping CLI dependency installation. pb-manager CLI might not work correctly."
 else
   if [ ! -f "package.json" ]; then
-    info "No package.json found, creating one..."
-    sudo npm init -y > /dev/null 2>&1 || warn "npm init -y failed, proceeding with dependency installation."
+    info "No package.json found for CLI, creating one..."
+    sudo npm init -y > /dev/null 2>&1 || warn "npm init -y failed, proceeding with CLI dependency installation."
   fi
-  sudo npm install ${PB_MANAGER_DEPS} > /dev/null 2>&1 || error "Failed to install pb-manager dependencies."
-  success "pb-manager dependencies installed/updated."
+  sudo npm install ${PB_MANAGER_DEPS} > /dev/null 2>&1 || error "Failed to install pb-manager CLI dependencies."
+  success "pb-manager CLI dependencies installed/updated."
 fi
 cd "${ORIGINAL_DIR}"
 
-info "Creating symlink for pb-manager at ${PB_MANAGER_SYMLINK_PATH}..."
+info "Creating symlink for pb-manager CLI at ${PB_MANAGER_SYMLINK_PATH}..."
 sudo ln -sfn "${PB_MANAGER_INSTALL_DIR}/pb-manager.js" "${PB_MANAGER_SYMLINK_PATH}" || error "Failed to create symlink for pb-manager."
 success "Symlink created. You can now use 'pb-manager' command (you might need to open a new terminal session)."
 
@@ -278,25 +279,80 @@ else
   warn "No UFW or firewalld found. Please configure your firewall manually to allow HTTP (80) and HTTPS (443) traffic if needed."
 fi
 
-read -p "Do you want to run setup now to download PocketBase binaries? [Y/n]: " run_setup
-if [[ "$run_setup" =~ ^[Nn]$ ]]; then
-  info "You can run setup later with: cd ${PB_MANAGER_INSTALL_DIR} && sudo node pb-manager.js setup"
+read -p "Do you want to run pb-manager CLI setup now to download PocketBase binaries? [Y/n]: " run_cli_setup
+if [[ "$run_cli_setup" =~ ^[Nn]$ ]]; then
+  info "You can run CLI setup later with: sudo pb-manager setup"
 else
-  info "Running setup to download PocketBase binaries..."
-  cd "${PB_MANAGER_INSTALL_DIR}" || error "Failed to change directory to ${PB_MANAGER_INSTALL_DIR}."
-  sudo node pb-manager.js setup > /dev/null 2>&1 || error "Setup failed. Please try running it manually later with: cd ${PB_MANAGER_INSTALL_DIR} && sudo node pb-manager.js setup"
+  info "Running pb-manager CLI setup to download PocketBase binaries..."
+  sudo "${PB_MANAGER_SYMLINK_PATH}" setup || error "CLI Setup failed. Please try running it manually later with: sudo pb-manager setup"
   if [ $? -eq 0 ]; then
-    success "Setup completed successfully."
+    success "CLI Setup completed successfully."
   else
-    error "Setup encountered errors."
+    error "CLI Setup encountered errors."
   fi
 fi
 
-success "-------------------------------------------------------"
-if [[ "$run_setup" =~ ^[Yy]$ ]]; then
-  success "pb-manager installation and setup complete!"
+read -p "Do you want to download and set up the optional pb-manager API server (pb-manager-api.js) now? [y/N]: " setup_api_server
+if [[ "$setup_api_server" =~ ^[Yy]$ ]]; then
+  info "Setting up pb-manager API server (pb-manager-api.js)..."
+  if [ -f "${PB_MANAGER_INSTALL_DIR}/pb-manager-api.js" ]; then
+    warn "${PB_MANAGER_INSTALL_DIR}/pb-manager-api.js already exists."
+    read -p "Do you want to overwrite it with the latest version from the repository? [Y/n]: " overwrite_api_script
+    if [[ "$overwrite_api_script" =~ ^[Nn]$ ]]; then
+      info "Skipping download of pb-manager-api.js. Using existing version."
+    else
+      info "Downloading pb-manager-api.js from ${PB_MANAGER_API_SCRIPT_URL}..."
+      sudo curl -fsSL "${PB_MANAGER_API_SCRIPT_URL}" -o "${PB_MANAGER_INSTALL_DIR}/pb-manager-api.js" || error "Failed to download pb-manager-api.js."
+      sudo chmod +x "${PB_MANAGER_INSTALL_DIR}/pb-manager-api.js" || error "Failed to make pb-manager-api.js executable."
+      success "pb-manager-api.js downloaded/updated and made executable."
+    fi
+  else
+    info "Downloading pb-manager-api.js from ${PB_MANAGER_API_SCRIPT_URL}..."
+    sudo curl -fsSL "${PB_MANAGER_API_SCRIPT_URL}" -o "${PB_MANAGER_INSTALL_DIR}/pb-manager-api.js" || error "Failed to download pb-manager-api.js."
+    sudo chmod +x "${PB_MANAGER_INSTALL_DIR}/pb-manager-api.js" || error "Failed to make pb-manager-api.js executable."
+    success "pb-manager-api.js downloaded and made executable."
+  fi
+
+  info "Installing Node.js dependencies for pb-manager API server in ${PB_MANAGER_INSTALL_DIR}..."
+  ORIGINAL_DIR_API=$(pwd)
+  cd "${PB_MANAGER_INSTALL_DIR}" || error "Failed to change directory to ${PB_MANAGER_INSTALL_DIR} for API deps."
+
+  PB_MANAGER_API_DEPS="express body-parser dotenv"
+  info "Required API server dependencies: ${PB_MANAGER_API_DEPS}"
+  read -p "Do you want to install/update these API server dependencies now? [Y/n]: " install_api_deps
+  if [[ "$install_api_deps" =~ ^[Nn]$ ]]; then
+    warn "Skipping API server dependency installation. pb-manager-api.js might not work correctly."
+  else
+    if [ ! -f "package.json" ]; then
+      info "No package.json found, creating one (this might overwrite if one was created for CLI deps only)..."
+      sudo npm init -y > /dev/null 2>&1 || warn "npm init -y failed, proceeding with API dependency installation."
+    fi
+    sudo npm install ${PB_MANAGER_API_DEPS} > /dev/null 2>&1 || error "Failed to install pb-manager API server dependencies."
+    success "pb-manager API server dependencies installed/updated."
+  fi
+  cd "${ORIGINAL_DIR_API}"
+  success "pb-manager API server setup complete."
+  info "To use the API server:"
+  info "1. Configure API settings in pb-manager CLI: sudo pb-manager configure (Enable API Communication and check API Internal Secret)."
+  info "2. Create a .env file in ${PB_MANAGER_INSTALL_DIR} with API_PORT and EXTERNAL_API_TOKEN."
+  info "   Example .env content:"
+  info "   API_PORT=3001"
+  info "   EXTERNAL_API_TOKEN=\"your_very_strong_and_secret_token\""
+  info "3. Run the API server: cd ${PB_MANAGER_INSTALL_DIR} && sudo node pb-manager-api.js"
+  info "   (Recommended to run with PM2: sudo pm2 start ${PB_MANAGER_INSTALL_DIR}/pb-manager-api.js --name pb-manager-api)"
 else
-  success "pb-manager installation complete!"
+  info "Skipping setup of the optional pb-manager API server."
+fi
+
+
+success "-------------------------------------------------------"
+if [[ "$run_cli_setup" =~ ^[Yy]$ ]]; then
+  success "pb-manager CLI installation and setup complete!"
+else
+  success "pb-manager CLI installation complete!"
+fi
+if [[ "$setup_api_server" =~ ^[Yy]$ ]]; then
+  success "pb-manager API server files also downloaded and dependencies installed/prompted."
 fi
 success "-------------------------------------------------------"
 

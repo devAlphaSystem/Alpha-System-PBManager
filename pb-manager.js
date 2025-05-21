@@ -19,6 +19,8 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
+const pbManagerVersion = "0.4.0";
+
 function detectDistro() {
   if (shell.which("apt-get")) {
     NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
@@ -244,6 +246,10 @@ async function getCliConfig() {
     defaultCertbotEmail: null,
     defaultPocketBaseVersion: latestVersion,
     completeLogging: false,
+    api: {
+      enabled: false,
+      secret: `pbmanager-internal-secret-${Date.now().toString(36)}${Math.random().toString(36).substring(2)}`,
+    },
   };
 
   if (await fs.pathExists(CLI_CONFIG_PATH)) {
@@ -253,7 +259,13 @@ async function getCliConfig() {
         config.defaultPocketBaseVersion = latestVersion;
       }
 
-      return { ...defaults, ...config };
+      const mergedConfig = {
+        ...defaults,
+        ...config,
+        api: { ...defaults.api, ...(config.api || {}) },
+      };
+
+      return mergedConfig;
     } catch (e) {
       if (completeLogging) {
         console.warn(chalk.yellow("Could not read CLI config, using defaults."));
@@ -288,6 +300,10 @@ async function ensureBaseSetup() {
 }
 
 async function getInstancesConfig() {
+  if (!(await fs.pathExists(INSTANCES_CONFIG_PATH))) {
+    await fs.writeJson(INSTANCES_CONFIG_PATH, { instances: {} });
+  }
+
   return fs.readJson(INSTANCES_CONFIG_PATH);
 }
 
@@ -304,7 +320,7 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
       console.log(chalk.green(`PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Skipping download.`));
     }
 
-    return;
+    return { success: true, message: "PocketBase executable already exists." };
   }
 
   if (await fs.pathExists(POCKETBASE_EXEC_PATH)) {
@@ -320,7 +336,7 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
     if (!confirmOverwrite) {
       console.log(chalk.yellow("Download cancelled by user."));
 
-      return;
+      return { success: false, message: "Download cancelled by user." };
     }
 
     if (completeLogging) {
@@ -367,11 +383,20 @@ async function downloadPocketBaseIfNotExists(versionOverride = null) {
     if (completeLogging) {
       console.log(chalk.green(`PocketBase v${versionToDownload} downloaded and extracted successfully to ${POCKETBASE_EXEC_PATH}.`));
     }
+
+    return {
+      success: true,
+      message: `PocketBase v${versionToDownload} downloaded.`,
+    };
   } catch (error) {
     console.error(chalk.red(`Error downloading or extracting PocketBase v${versionToDownload}:`), error.message);
 
     if (error.response && error.response.status === 404) {
       console.error(chalk.red(`Version ${versionToDownload} not found. Please check the version number.`));
+    }
+
+    if (program.runningCommand && program.runningCommand.name() === "_internal-api-request") {
+      return { success: false, message: error.message, error };
     }
 
     throw error;
@@ -391,7 +416,7 @@ function runCommand(command, errorMessage, ignoreError = false, options = {}) {
       console.error(chalk.red(result.stderr));
     }
 
-    throw new Error(errorMessage || `Command failed: ${command}`);
+    throw new Error(`${errorMessage} - Stderr: ${result.stderr}`);
   }
 
   return result;
@@ -421,19 +446,39 @@ async function updatePm2EcosystemFile() {
 
   await fs.writeFile(PM2_ECOSYSTEM_FILE, ecosystemContent);
 
-  console.log(chalk.green("PM2 ecosystem file updated."));
+  if (!program.runningCommand || program.runningCommand.name() !== "_internal-api-request") {
+    console.log(chalk.green("PM2 ecosystem file updated."));
+  }
+
+  return { success: true, message: "PM2 ecosystem file updated." };
 }
 
 async function reloadPm2(specificInstanceName = null) {
-  if (specificInstanceName) {
-    runCommand(`pm2 restart pb-${specificInstanceName}`);
-  } else {
-    runCommand(`pm2 reload ${PM2_ECOSYSTEM_FILE}`);
+  try {
+    if (specificInstanceName) {
+      runCommand(`pm2 restart pb-${specificInstanceName}`);
+    } else {
+      runCommand(`pm2 reload ${PM2_ECOSYSTEM_FILE}`);
+    }
+
+    runCommand("pm2 save");
+
+    const message = specificInstanceName ? `PM2 process pb-${specificInstanceName} restarted and PM2 state saved.` : "PM2 ecosystem reloaded and PM2 state saved.";
+
+    if (!program.runningCommand || program.runningCommand.name() !== "_internal-api-request") {
+      console.log(chalk.green(message));
+    }
+
+    return { success: true, message };
+  } catch (error) {
+    const message = `Failed to reload PM2: ${error.message}`;
+
+    if (!program.runningCommand || program.runningCommand.name() !== "_internal-api-request") {
+      console.error(chalk.red(message));
+    }
+
+    return { success: false, message };
   }
-
-  runCommand("pm2 save");
-
-  console.log(chalk.green(specificInstanceName ? `PM2 process pb-${specificInstanceName} restarted and PM2 state saved.` : "PM2 ecosystem reloaded and PM2 state saved."));
 }
 
 async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, maxBody20Mb) {
@@ -530,10 +575,22 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     try {
       runCommand(`sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`);
     } catch (error) {
-      console.error(chalk.red("Failed to create Nginx symlink. Please try running this command with sudo, or create the symlink manually."));
-      console.log(chalk.yellow(`Manually run: sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`));
+      const errorMsg = `Failed to create Nginx symlink for ${nginxConfPath} to ${nginxEnabledPath}: ${error.message}. Please try running this command with sudo, or create the symlink manually.`;
+
+      if (!program.runningCommand || program.runningCommand.name() !== "_internal-api-request") {
+        console.error(chalk.red(errorMsg));
+        console.log(chalk.yellow(`Manually run: sudo ln -sfn ${nginxConfPath} ${nginxEnabledPath}`));
+      }
+
+      throw new Error(errorMsg);
     }
   }
+
+  return {
+    success: true,
+    message: `Nginx config generated for ${instanceName} at ${nginxConfPath}`,
+    path: nginxConfPath,
+  };
 }
 
 async function reloadNginx() {
@@ -578,13 +635,21 @@ async function reloadNginx() {
       throw new Error("Could not reload Nginx with systemctl, service, or nginx -s reload.");
     }
 
-    console.log(chalk.green("Nginx reloaded successfully."));
-  } catch (error) {
-    console.error(chalk.red("Nginx test failed or reload failed. Please check Nginx configuration."));
-    console.log(chalk.yellow("You can try to diagnose Nginx issues by running: sudo nginx -t"));
-    console.log(chalk.yellow("Check Nginx error logs, typically found in /var/log/nginx/error.log"));
+    if (!program.runningCommand || program.runningCommand.name() !== "_internal-api-request") {
+      console.log(chalk.green("Nginx reloaded successfully."));
+    }
 
-    throw error;
+    return { success: true, message: "Nginx reloaded successfully." };
+  } catch (error) {
+    const errorMsg = `Nginx test failed or reload failed: ${error.message}. Please check Nginx configuration.`;
+
+    if (!program.runningCommand || program.runningCommand.name() !== "_internal-api-request") {
+      console.error(chalk.red(errorMsg));
+      console.log(chalk.yellow("You can try to diagnose Nginx issues by running: sudo nginx -t"));
+      console.log(chalk.yellow("Check Nginx error logs, typically found in /var/log/nginx/error.log"));
+    }
+
+    return { success: false, message: errorMsg, error };
   }
 }
 
@@ -603,24 +668,36 @@ async function ensureDhParamExists() {
       if (completeLogging) {
         console.log(chalk.green(`${dhParamPath} generated successfully.`));
       }
+
+      return {
+        success: true,
+        message: `${dhParamPath} generated successfully.`,
+      };
     } catch (error) {
-      console.error(chalk.red(`Error generating ${dhParamPath}: ${error.message}`));
+      const errorMsg = `Error generating ${dhParamPath}: ${error.message}`;
+      console.error(chalk.red(errorMsg));
+
+      return { success: false, message: errorMsg };
     }
   } else {
     if (completeLogging) {
       console.log(chalk.green(`${dhParamPath} already exists.`));
     }
+
+    return { success: true, message: `${dhParamPath} already exists.` };
   }
 }
 
-async function runCertbot(domain, email) {
+async function runCertbot(domain, email, isCliCall = true) {
   if (!shell.which("certbot")) {
-    console.error(chalk.red("Certbot command not found. Please install Certbot first."));
+    const msg = "Certbot command not found. Please install Certbot first.";
 
-    return false;
+    if (isCliCall) console.error(chalk.red(msg));
+
+    return { success: false, message: msg };
   }
 
-  if (completeLogging) {
+  if (completeLogging && isCliCall) {
     console.log(chalk.blue(`Attempting to obtain SSL certificate for ${domain} using Certbot...`));
   }
 
@@ -636,34 +713,43 @@ async function runCertbot(domain, email) {
     certbotCommand = `sudo certbot --nginx -d ${domain} --non-interactive --agree-tos -m "${email}" --redirect`;
   }
 
-  const { confirmCertbotRun } = await inquirer.prompt([
-    {
-      type: "confirm",
-      name: "confirmCertbotRun",
-      message: `Ready to run Certbot for domain ${domain} with email ${email}. Command: ${certbotCommand}. Proceed?`,
-      default: true,
-    },
-  ]);
+  if (isCliCall) {
+    const { confirmCertbotRun } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmCertbotRun",
+        message: `Ready to run Certbot for domain ${domain} with email ${email}. Command: ${certbotCommand}. Proceed?`,
+        default: true,
+      },
+    ]);
 
-  if (!confirmCertbotRun) {
-    console.log(chalk.yellow("Certbot execution cancelled by user."));
+    if (!confirmCertbotRun) {
+      console.log(chalk.yellow("Certbot execution cancelled by user."));
 
-    return false;
+      return {
+        success: false,
+        message: "Certbot execution cancelled by user.",
+      };
+    }
   }
 
   try {
     runCommand(certbotCommand, "Certbot command failed.");
 
-    if (completeLogging) {
-      console.log(chalk.green(`Certbot successfully obtained and installed certificate for ${domain}.`));
+    const successMsg = `Certbot successfully obtained and installed certificate for ${domain}.`;
+
+    if (completeLogging && isCliCall) console.log(chalk.green(successMsg));
+
+    return { success: true, message: successMsg };
+  } catch (error) {
+    const errorMsg = `Certbot failed for ${domain}: ${error.message}. Check Certbot logs.`;
+
+    if (isCliCall) {
+      console.error(chalk.red(errorMsg));
+      console.log(chalk.yellow("You can try running Certbot manually or check logs in /var/log/letsencrypt/"));
     }
 
-    return true;
-  } catch (error) {
-    console.error(chalk.red(`Certbot failed for ${domain}. Check Certbot logs.`));
-    console.log(chalk.yellow("You can try running Certbot manually or check logs in /var/log/letsencrypt/"));
-
-    return false;
+    return { success: false, message: errorMsg, error };
   }
 }
 
@@ -958,6 +1044,719 @@ async function showDashboard() {
   screen.render();
 }
 
+async function _internalGetGlobalStats() {
+  try {
+    const cliConfig = await getCliConfig();
+
+    return {
+      success: true,
+      data: {
+        pbManagerVersion,
+        defaultPocketBaseVersion: cliConfig.defaultPocketBaseVersion,
+        pocketBaseExecutablePath: POCKETBASE_EXEC_PATH,
+        configDirectory: CONFIG_DIR,
+        nginxSitesAvailable: NGINX_SITES_AVAILABLE,
+        nginxSitesEnabled: NGINX_SITES_ENABLED,
+        nginxDistroMode: NGINX_DISTRO_MODE,
+        completeLoggingEnabled: completeLogging,
+      },
+    };
+  } catch (error) {
+    return { success: false, error: error.message, messages: [error.message] };
+  }
+}
+
+async function _internalGetInstanceLogs(payload) {
+  const { name, lines = 100 } = payload;
+  if (!name) {
+    return { success: false, error: "Instance name is required for logs.", messages: ["Instance name is required for logs."] };
+  }
+  const instancePM2Name = `pb-${name}`;
+  try {
+    const config = await getInstancesConfig();
+    if (!config.instances[name]) {
+      return { success: false, error: `Instance "${name}" not found in configuration.`, messages: [`Instance "${name}" not found in configuration.`] };
+    }
+
+    const logCommand = `pm2 logs ${instancePM2Name} --lines ${lines} --nostream --raw`;
+    const result = shell.exec(logCommand, { silent: true });
+
+    let logs = result.stdout || "";
+    if (result.stderr && !result.stderr.includes("process name not found")) {
+      logs += `\n--- STDERR ---\n${result.stderr}`;
+    }
+    if (result.stderr?.includes("process name not found") && result.stdout.trim() === "") {
+      return { success: false, error: `PM2 process ${instancePM2Name} not found or no logs available.`, details: result.stderr, messages: [`PM2 process ${instancePM2Name} not found or no logs available.`] };
+    }
+
+    return { success: true, data: { name, logs: logs.trim() || "No log output." }, messages: ["Logs retrieved."] };
+  } catch (error) {
+    return { success: false, error: `Failed to get logs for ${instancePM2Name}: ${error.message}`, messages: [`Failed to get logs for ${instancePM2Name}: ${error.message}`] };
+  }
+}
+
+async function _internalListInstances() {
+  const config = await getInstancesConfig();
+  if (Object.keys(config.instances).length === 0) {
+    return [];
+  }
+
+  const pm2Statuses = {};
+
+  try {
+    const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
+    if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
+      const pm2List = JSON.parse(pm2ListRaw.stdout);
+      for (const proc of pm2List) {
+        if (proc.name.startsWith("pb-")) {
+          pm2Statuses[proc.name.substring(3)] = proc.pm2_env.status;
+        }
+      }
+    }
+  } catch (e) {}
+
+  const output = [];
+  for (const name in config.instances) {
+    const inst = config.instances[name];
+
+    let certExpiry = "-";
+
+    if (inst.useHttps) {
+      certExpiry = await getCertExpiryDays(inst.domain);
+    }
+
+    const status = pm2Statuses[name] || "UNKNOWN";
+    const protocol = inst.useHttps ? "https" : "http";
+    const publicUrl = `${protocol}://${inst.domain}`;
+
+    output.push({
+      name,
+      domain: inst.domain,
+      protocol,
+      publicUrl: `${publicUrl}/_/`,
+      internalPort: inst.port,
+      dataDirectory: inst.dataDir,
+      pm2Status: status,
+      adminURL: `http://127.0.0.1:${inst.port}/_/`,
+      certExpiryDays: certExpiry,
+    });
+  }
+
+  return output;
+}
+
+async function _internalAddInstance(payload) {
+  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, maxBody20Mb = true, autoRunCertbot = true } = payload;
+
+  const results = {
+    success: false,
+    messages: [],
+    instance: null,
+    nginxConfigPath: null,
+    certbotSuccess: null,
+    error: null,
+  };
+
+  try {
+    await ensureBaseSetup();
+
+    const pbDownloadResult = await downloadPocketBaseIfNotExists();
+    if (pbDownloadResult && pbDownloadResult.success === false && !(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+      results.messages.push(`PocketBase executable not found and download failed: ${pbDownloadResult.message}`);
+      results.error = "PocketBase download failed";
+
+      return results;
+    }
+
+    const config = await getInstancesConfig();
+    if (config.instances[name]) {
+      results.messages.push(`Instance "${name}" already exists.`);
+      results.error = "Instance already exists";
+
+      return results;
+    }
+
+    for (const instName in config.instances) {
+      if (config.instances[instName].port === port) {
+        results.messages.push(`Port ${port} is already in use by instance "${instName}".`);
+        results.error = "Port in use";
+
+        return results;
+      }
+
+      if (config.instances[instName].domain === domain) {
+        results.messages.push(`Domain ${domain} is already in use by instance "${instName}".`);
+        results.error = "Domain in use";
+
+        return results;
+      }
+    }
+
+    if (useHttps && !emailForCertbot) {
+      results.messages.push("Email for Certbot is required when HTTPS is enabled.");
+      results.error = "Missing Certbot email";
+
+      return results;
+    }
+
+    const instanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, name);
+    await fs.ensureDir(instanceDataDir);
+
+    const newInstanceConfig = {
+      name,
+      domain,
+      port,
+      dataDir: instanceDataDir,
+      useHttps,
+      emailForCertbot: useHttps ? emailForCertbot : null,
+      useHttp2,
+      maxBody20Mb,
+    };
+
+    config.instances[name] = newInstanceConfig;
+
+    await saveInstancesConfig(config);
+
+    results.messages.push(`Instance "${name}" configuration saved.`);
+    results.instance = newInstanceConfig;
+
+    let certbotRanSuccessfully = false;
+
+    const nginxResult = await generateNginxConfig(name, domain, port, false, false, maxBody20Mb);
+    results.nginxConfigPath = nginxResult.path;
+    results.messages.push(nginxResult.message);
+
+    const nginxReload1 = await reloadNginx();
+    results.messages.push(nginxReload1.message);
+    if (!nginxReload1.success) throw nginxReload1.error || new Error(nginxReload1.message);
+
+    if (useHttps) {
+      await ensureDhParamExists();
+      if (autoRunCertbot) {
+        const certbotResult = await runCertbot(domain, emailForCertbot, false);
+        results.certbotSuccess = certbotResult.success;
+        results.messages.push(`Certbot for ${domain}: ${certbotResult.message}`);
+
+        certbotRanSuccessfully = certbotResult.success;
+
+        if (certbotResult.success) {
+          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, maxBody20Mb);
+          results.messages.push(httpsNginxResult.message);
+        } else {
+          results.messages.push("Certbot failed. Nginx remains HTTP-only.");
+        }
+      } else {
+        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, maxBody20Mb);
+        results.messages.push(httpsNginxResult.message);
+        results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed.");
+      }
+    } else {
+      results.messages.push("HTTP-only Nginx config generated (or updated).");
+    }
+
+    const nginxReload2 = await reloadNginx();
+    results.messages.push(nginxReload2.message);
+    if (!nginxReload2.success) throw nginxReload2.error || new Error(nginxReload2.message);
+
+    const pm2UpdateResult = await updatePm2EcosystemFile();
+    results.messages.push(pm2UpdateResult.message);
+    if (!pm2UpdateResult.success) throw new Error(pm2UpdateResult.message);
+
+    const pm2ReloadResult = await reloadPm2();
+    results.messages.push(pm2ReloadResult.message);
+    if (!pm2ReloadResult.success) throw new Error(pm2ReloadResult.message);
+
+    results.success = true;
+
+    const finalProtocol = useHttps && certbotRanSuccessfully ? "https" : "http";
+    results.instance.url = `${finalProtocol}://${domain}/_/`;
+    results.messages.push(`Instance "${name}" added and started. Access at ${results.instance.url}`);
+  } catch (error) {
+    results.messages.push(`Error during internal add instance: ${error.message}`);
+    results.error = error.message;
+
+    if (completeLogging) console.error(error.stack);
+  }
+
+  return results;
+}
+
+async function _internalRemoveInstance(payload) {
+  const { name } = payload;
+  const results = { success: false, messages: [], error: null };
+
+  try {
+    const config = await getInstancesConfig();
+    if (!config.instances[name]) {
+      results.error = `Instance "${name}" not found.`;
+
+      results.messages.push(results.error);
+
+      return results;
+    }
+
+    const instanceDataDir = config.instances[name].dataDir;
+
+    try {
+      runCommand(`pm2 stop pb-${name}`, `Stopping pb-${name}`, true);
+
+      results.messages.push(`Attempted to stop PM2 process pb-${name}.`);
+
+      runCommand(`pm2 delete pb-${name}`, `Deleting pb-${name}`, true);
+
+      results.messages.push(`Attempted to delete PM2 process pb-${name}.`);
+    } catch (e) {
+      results.messages.push(`Warning: Could not stop/delete PM2 process pb-${name} (maybe not running/exists): ${e.message}`);
+    }
+
+    const nginxConfPathBase = NGINX_DISTRO_MODE === "rhel" ? `${name}.conf` : name;
+    const nginxConfPath = path.join(NGINX_SITES_AVAILABLE, nginxConfPathBase);
+    const nginxEnabledPath = NGINX_DISTRO_MODE === "rhel" ? nginxConfPath : path.join(NGINX_SITES_ENABLED, name);
+
+    if (NGINX_DISTRO_MODE !== "rhel" && (await fs.pathExists(nginxEnabledPath))) {
+      try {
+        runCommand(`sudo rm ${nginxEnabledPath}`);
+
+        results.messages.push(`Removed Nginx symlink ${nginxEnabledPath}.`);
+      } catch (e) {
+        results.messages.push(`Warning: Failed to remove Nginx symlink ${nginxEnabledPath}: ${e.message}`);
+      }
+    }
+
+    if (await fs.pathExists(nginxConfPath)) {
+      try {
+        runCommand(`sudo rm ${nginxConfPath}`);
+
+        results.messages.push(`Removed Nginx config ${nginxConfPath}.`);
+      } catch (e) {
+        results.messages.push(`Warning: Failed to remove Nginx config ${nginxConfPath}: ${e.message}`);
+      }
+    }
+
+    delete config.instances[name];
+
+    await saveInstancesConfig(config);
+
+    results.messages.push(`Instance "${name}" removed from configuration.`);
+
+    await updatePm2EcosystemFile();
+
+    try {
+      runCommand("pm2 save");
+      results.messages.push("PM2 state saved.");
+    } catch (e) {}
+
+    await reloadNginx();
+
+    results.messages.push(`Data directory at ${instanceDataDir} was NOT deleted. Manual deletion required if desired.`);
+    results.success = true;
+  } catch (error) {
+    results.messages.push(`Error during internal remove instance: ${error.message}`);
+    results.error = error.message;
+  }
+
+  return results;
+}
+
+async function _internalCloneInstance(payload) {
+  const { sourceName, newName, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, maxBody20Mb = true, autoRunCertbot = true } = payload;
+
+  const results = { success: false, messages: [], instance: null, nginxConfigPath: null, certbotSuccess: null, error: null };
+
+  try {
+    await ensureBaseSetup();
+
+    if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+      results.messages.push("PocketBase executable not found. Attempting download.");
+      const dlResult = await downloadPocketBaseIfNotExists();
+      if (dlResult && dlResult.success === false) {
+        results.error = `PocketBase executable not found and download failed: ${dlResult.message}`;
+        results.messages.push(results.error);
+        return results;
+      }
+      if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+        results.error = "PocketBase download failed after attempt. Cannot clone instance.";
+        results.messages.push(results.error);
+        return results;
+      }
+    }
+
+    const config = await getInstancesConfig();
+    const sourceInstance = config.instances[sourceName];
+
+    if (!sourceInstance) {
+      results.error = `Source instance "${sourceName}" not found.`;
+      results.messages.push(results.error);
+      return results;
+    }
+
+    if (config.instances[newName]) {
+      results.error = `Target instance "${newName}" already exists.`;
+      results.messages.push(results.error);
+      return results;
+    }
+
+    for (const instName in config.instances) {
+      if (config.instances[instName].port === port) {
+        results.error = `Port ${port} is already in use by instance "${instName}".`;
+        results.messages.push(results.error);
+        return results;
+      }
+      if (config.instances[instName].domain === domain) {
+        results.error = `Domain ${domain} is already in use by instance "${instName}".`;
+        results.messages.push(results.error);
+        return results;
+      }
+    }
+
+    if (useHttps && !emailForCertbot) {
+      results.error = "Email for Certbot is required when HTTPS is enabled for the clone.";
+      results.messages.push(results.error);
+      return results;
+    }
+
+    if (useHttps && autoRunCertbot) {
+      const dnsValid = await validateDnsRecords(domain);
+      if (!dnsValid) {
+        results.messages.push(chalk.yellow(`DNS validation failed for ${domain}. Certbot will likely fail. Proceeding, but manual intervention may be needed.`));
+      }
+    }
+
+    const newInstanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, newName);
+    await fs.ensureDir(path.dirname(newInstanceDataDir));
+
+    results.messages.push(`Copying data from ${sourceInstance.dataDir} to ${newInstanceDataDir}...`);
+    try {
+      await fs.copy(sourceInstance.dataDir, newInstanceDataDir);
+      results.messages.push("Data copied successfully.");
+    } catch (err) {
+      results.error = `Error copying data: ${err.message}`;
+      results.messages.push(results.error);
+      return results;
+    }
+
+    const newInstanceConfig = { name: newName, domain, port, dataDir: newInstanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, maxBody20Mb };
+    config.instances[newName] = newInstanceConfig;
+    await saveInstancesConfig(config);
+    results.messages.push(`Instance "${newName}" configuration saved.`);
+    results.instance = newInstanceConfig;
+
+    let certbotRanSuccessfully = false;
+
+    const nginxResultHttp = await generateNginxConfig(newName, domain, port, false, false, maxBody20Mb);
+    results.messages.push(nginxResultHttp.message);
+    if (nginxResultHttp.path) results.nginxConfigPath = nginxResultHttp.path;
+
+    const nginxReload1 = await reloadNginx();
+    results.messages.push(nginxReload1.message);
+    if (!nginxReload1.success) {
+      results.error = nginxReload1.error?.message || nginxReload1.message || "Nginx reload after HTTP config failed.";
+      return results;
+    }
+
+    if (useHttps) {
+      await ensureDhParamExists();
+      if (autoRunCertbot) {
+        const certbotResult = await runCertbot(domain, emailForCertbot, false);
+        results.certbotSuccess = certbotResult.success;
+        results.messages.push(`Certbot for ${domain}: ${certbotResult.message}`);
+        certbotRanSuccessfully = certbotResult.success;
+
+        if (certbotResult.success) {
+          const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, maxBody20Mb);
+          results.messages.push(httpsNginxResult.message);
+          if (httpsNginxResult.path) results.nginxConfigPath = httpsNginxResult.path;
+        } else {
+          results.messages.push("Certbot failed. Nginx may remain HTTP-only.");
+        }
+      } else {
+        const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, maxBody20Mb);
+        results.messages.push(httpsNginxResult.message);
+        if (httpsNginxResult.path) results.nginxConfigPath = httpsNginxResult.path;
+        results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
+      }
+    } else {
+      results.messages.push("HTTP-only Nginx config generated.");
+    }
+
+    const nginxReload2 = await reloadNginx();
+    results.messages.push(nginxReload2.message);
+    if (!nginxReload2.success) {
+      results.error = nginxReload2.error?.message || nginxReload2.message || "Final Nginx reload failed.";
+      return results;
+    }
+
+    const pm2UpdateResult = await updatePm2EcosystemFile();
+    results.messages.push(pm2UpdateResult.message);
+    if (!pm2UpdateResult.success) {
+      results.error = pm2UpdateResult.message || "PM2 ecosystem update failed.";
+      return results;
+    }
+
+    const pm2ReloadResult = await reloadPm2();
+    results.messages.push(pm2ReloadResult.message);
+    if (!pm2ReloadResult.success) {
+      results.error = pm2ReloadResult.message || "PM2 reload failed.";
+      return results;
+    }
+
+    results.success = true;
+    const finalProtocol = useHttps && certbotRanSuccessfully ? "https" : "http";
+    results.instance.url = `${finalProtocol}://${domain}/_/`;
+    results.messages.push(`Instance "${newName}" cloned and services reloaded. Access at ${results.instance.url}`);
+  } catch (error) {
+    results.messages.push(`Error during internal clone instance: ${error.message}`);
+    results.error = error.message;
+    if (completeLogging) console.error(error.stack);
+  }
+  return results;
+}
+
+async function _internalResetInstance(payload) {
+  const { name, createAdmin = false, adminEmail, adminPassword } = payload;
+  const results = { success: false, messages: [], error: null };
+
+  try {
+    const config = await getInstancesConfig();
+    if (!config.instances[name]) {
+      results.error = `Instance "${name}" not found.`;
+      results.messages.push(results.error);
+      return results;
+    }
+
+    const instance = config.instances[name];
+    const dataDir = instance.dataDir;
+
+    results.messages.push(`Stopping and deleting PM2 process for pb-${name}...`);
+    try {
+      runCommand(`pm2 stop pb-${name}`, `Stopping pb-${name}`, true);
+      runCommand(`pm2 delete pb-${name}`, `Deleting pb-${name}`, true);
+    } catch (e) {
+      results.messages.push(`Warning: Could not stop/delete PM2 process pb-${name} (maybe not running/exists): ${e.message}`);
+    }
+
+    results.messages.push(`Deleting data directory ${dataDir}...`);
+    if (await fs.pathExists(dataDir)) {
+      try {
+        await fs.remove(dataDir);
+        results.messages.push(`Data directory ${dataDir} deleted.`);
+      } catch (e) {
+        results.error = `Failed to delete data directory: ${e.message}`;
+        results.messages.push(results.error);
+        return results;
+      }
+    }
+    await fs.ensureDir(dataDir);
+    results.messages.push(`Data directory ${dataDir} recreated.`);
+
+    await updatePm2EcosystemFile();
+    await reloadPm2();
+    results.messages.push(`Instance "${name}" has been reset and PM2 reloaded.`);
+
+    if (createAdmin) {
+      if (!adminEmail || !adminPassword) {
+        results.messages.push("Admin email and password required for admin creation during reset, but not provided. Skipping admin creation.");
+      } else {
+        const migrationsDir = path.join(dataDir, "pb_migrations");
+        const adminCreateCommand = `${POCKETBASE_EXEC_PATH} superuser create "${adminEmail}" "${adminPassword}" --dir "${dataDir}" --migrationsDir "${migrationsDir}"`;
+        results.messages.push(`Attempting to create superuser (admin) account: ${adminEmail}`);
+        try {
+          const adminResult = runCommand(adminCreateCommand, "Failed to create superuser (admin) account via CLI.");
+          if (adminResult?.stdout?.includes("Successfully created new superuser")) {
+            results.messages.push(adminResult.stdout.trim());
+            results.messages.push(`Superuser (admin) account for ${adminEmail} created successfully!`);
+          } else {
+            results.messages.push(`Admin creation output: ${adminResult.stdout} ${adminResult.stderr}`);
+          }
+        } catch (e) {
+          results.messages.push(`Superuser (admin) account creation via CLI failed: ${e.message}`);
+        }
+      }
+    }
+
+    results.messages.push(`Starting instance pb-${name}...`);
+    runCommand(`pm2 start pb-${name}`, `Starting pb-${name}`, true);
+    results.success = true;
+    results.messages.push(`Instance "${name}" reset and started.`);
+  } catch (error) {
+    results.messages.push(`Error during internal reset instance: ${error.message}`);
+    results.error = error.message;
+    if (completeLogging) console.error(error.stack);
+  }
+  return results;
+}
+
+async function _internalResetAdminPassword(payload) {
+  const { name, adminEmail, adminPassword } = payload;
+  const results = { success: false, messages: [], error: null };
+
+  try {
+    const config = await getInstancesConfig();
+    if (!config.instances[name]) {
+      results.error = `Instance "${name}" not found.`;
+      results.messages.push(results.error);
+      return results;
+    }
+    if (!adminEmail || !adminPassword) {
+      results.error = "Admin email and new password are required.";
+      results.messages.push(results.error);
+      return results;
+    }
+
+    const instance = config.instances[name];
+    const dataDir = instance.dataDir;
+    const adminUpdateCommand = `${POCKETBASE_EXEC_PATH} superuser update "${adminEmail}" "${adminPassword}" --dir "${dataDir}"`;
+
+    results.messages.push(`Attempting to reset admin password for ${adminEmail} on instance ${name}...`);
+    const result = runCommand(adminUpdateCommand, "Failed to reset superuser (admin) password via CLI.");
+    if (result?.stdout?.includes("Successfully updated superuser")) {
+      results.messages.push(result.stdout.trim());
+      results.messages.push(`Superuser (admin) password for ${adminEmail} reset successfully!`);
+      results.success = true;
+    } else {
+      results.error = "Admin password reset command did not confirm success.";
+      results.messages.push(results.error);
+      if (result.stdout) results.messages.push(`Stdout: ${result.stdout}`);
+      if (result.stderr) results.messages.push(`Stderr: ${result.stderr}`);
+    }
+  } catch (error) {
+    results.messages.push(`Error during internal admin password reset: ${error.message}`);
+    results.error = error.message;
+    if (completeLogging) console.error(error.stack);
+  }
+  return results;
+}
+
+async function _internalRenewCertificates(payload) {
+  const { instanceName, force } = payload;
+  const results = { success: false, messages: [], error: null };
+
+  if (!shell.which("certbot")) {
+    results.error = "Certbot command not found. Please install Certbot first.";
+    results.messages.push(results.error);
+    return results;
+  }
+
+  let commandToRun;
+  let baseMessage;
+
+  if (instanceName && instanceName.toLowerCase() !== "all") {
+    const config = await getInstancesConfig();
+    const instance = config.instances[instanceName];
+    if (!instance || !instance.useHttps) {
+      results.error = `Instance "${instanceName}" not found or does not use HTTPS.`;
+      results.messages.push(results.error);
+      return results;
+    }
+    commandToRun = `sudo certbot renew --cert-name ${instance.domain}`;
+    baseMessage = `Attempted certificate renewal for ${instance.domain}.`;
+  } else {
+    commandToRun = "sudo certbot renew";
+    baseMessage = "Attempted renewal for all managed certificates.";
+  }
+
+  if (force) {
+    commandToRun += " --force-renewal";
+  }
+
+  try {
+    results.messages.push(`Executing: ${commandToRun}`);
+    runCommand(commandToRun, "Certbot renewal command failed.");
+    results.messages.push(baseMessage);
+    results.messages.push("Reloading Nginx to apply any changes...");
+    const nginxReloadResult = await reloadNginx();
+    results.messages.push(nginxReloadResult.message);
+    if (!nginxReloadResult.success) {
+      throw nginxReloadResult.error || new Error(nginxReloadResult.message);
+    }
+    results.success = true;
+  } catch (error) {
+    results.error = `Certificate renewal process failed: ${error.message}`;
+    results.messages.push(results.error);
+    results.messages.push("Check Certbot logs in /var/log/letsencrypt/ for more details.");
+    if (completeLogging) console.error(error.stack);
+  }
+  return results;
+}
+
+async function _internalUpdatePocketBaseExecutable() {
+  const results = { success: false, messages: [], error: null };
+  try {
+    if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+      results.error = "PocketBase executable not found. Run 'setup' or 'configure' first.";
+      results.messages.push(results.error);
+      return results;
+    }
+
+    results.messages.push(`Running: ${POCKETBASE_EXEC_PATH} update`);
+    const updateResult = shell.exec(`${POCKETBASE_EXEC_PATH} update`, { cwd: POCKETBASE_BIN_DIR, silent: !completeLogging });
+
+    if (updateResult.code !== 0) {
+      results.error = "PocketBase update command failed.";
+      results.messages.push(results.error);
+      if (updateResult.stderr) results.messages.push(`Stderr: ${updateResult.stderr}`);
+      return results;
+    }
+    results.messages.push("PocketBase executable update process finished.");
+    if (updateResult.stdout) results.messages.push(`Stdout: ${updateResult.stdout}`);
+
+    results.messages.push("Restarting all PocketBase instances via PM2...");
+    const instancesConf = await getInstancesConfig();
+    let allRestarted = true;
+    for (const instName in instancesConf.instances) {
+      try {
+        runCommand(`pm2 restart pb-${instName}`);
+        results.messages.push(`Instance pb-${instName} restarted.`);
+      } catch (e) {
+        results.messages.push(`Failed to restart instance pb-${instName}: ${e.message}`);
+        allRestarted = false;
+      }
+    }
+    if (allRestarted) {
+      results.messages.push("All instances processed for restarting.");
+    } else {
+      results.messages.push("Some instances may not have restarted correctly. Check PM2 logs.");
+    }
+    results.success = true;
+  } catch (error) {
+    results.error = `Failed to run PocketBase update process: ${error.message}`;
+    results.messages.push(results.error);
+    if (completeLogging) console.error(error.stack);
+  }
+  return results;
+}
+
+async function _internalUpdateEcosystemAndReloadPm2() {
+  try {
+    await updatePm2EcosystemFile();
+    const reloadResult = await reloadPm2();
+    if (!reloadResult.success) {
+      return { success: false, error: "Failed to reload PM2 after ecosystem update.", messages: ["PM2 ecosystem file updated, but PM2 reload failed.", reloadResult.message] };
+    }
+    return { success: true, messages: ["PM2 ecosystem file updated and PM2 reloaded successfully."] };
+  } catch (error) {
+    return { success: false, error: error.message, messages: [`Error updating ecosystem/reloading PM2: ${error.message}`] };
+  }
+}
+
+async function _internalSetDefaultCertbotEmail(payload) {
+  const { email } = payload;
+  if (email !== null && typeof email !== "string" && email !== "") {
+    return { success: false, error: "Invalid payload: 'email' must be a valid email string, empty string, or null.", messages: ["Invalid payload for setting Certbot email."] };
+  }
+  if (typeof email === "string" && email !== "" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { success: false, error: "Invalid payload: 'email' must be a valid email format.", messages: ["Invalid email format for Certbot email."] };
+  }
+  try {
+    const cliConfig = await getCliConfig();
+    cliConfig.defaultCertbotEmail = email || null;
+    await saveCliConfig(cliConfig);
+    return { success: true, messages: [`Default Certbot email set to ${cliConfig.defaultCertbotEmail || "not set"}.`] };
+  } catch (error) {
+    return { success: false, error: error.message, messages: [`Error setting default Certbot email: ${error.message}`] };
+  }
+}
+
 program
   .command("dashboard")
   .description("Show interactive dashboard for all PocketBase instances")
@@ -967,36 +1766,40 @@ program
 
 program
   .command("configure")
-  .description("Set or view CLI configurations (e.g., default Certbot email, PocketBase version).")
+  .description("Set or view CLI configurations (e.g., default Certbot email, PocketBase version, API settings).")
   .action(async () => {
     await ensureBaseSetup();
 
     const cliConfig = await getCliConfig();
 
-    const { action } = await inquirer.prompt([
+    const choices = [
       {
-        type: "list",
-        name: "action",
-        message: "CLI Configuration:",
-        choices: [
-          {
-            name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`,
-            value: "setEmail",
-          },
-          {
-            name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`,
-            value: "setPbVersion",
-          },
-          {
-            name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`,
-            value: "setLogging",
-          },
-          new inquirer.Separator(),
-          { name: "View current JSON config", value: "viewConfig" },
-          { name: "Exit", value: "exit" },
-        ],
+        name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`,
+        value: "setEmail",
       },
-    ]);
+      {
+        name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`,
+        value: "setPbVersion",
+      },
+      {
+        name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`,
+        value: "setLogging",
+      },
+      new inquirer.Separator("API Settings"),
+      {
+        name: `Enable API Communication: ${cliConfig.api.enabled ? chalk.green("Yes") : chalk.red("No")}`,
+        value: "setApiEnabled",
+      },
+      {
+        name: `API Internal Secret: ${cliConfig.api.secret ? `${cliConfig.api.secret.substring(0, 8)}...` : "Not Set"}`,
+        value: "setApiSecret",
+      },
+      new inquirer.Separator(),
+      { name: "View current JSON config", value: "viewConfig" },
+      { name: "Exit", value: "exit" },
+    ];
+
+    const { action } = await inquirer.prompt([{ type: "list", name: "action", message: "CLI Configuration:", choices }]);
 
     switch (action) {
       case "setEmail": {
@@ -1010,10 +1813,6 @@ program
         ]);
 
         cliConfig.defaultCertbotEmail = email || null;
-
-        await saveCliConfig(cliConfig);
-
-        console.log(chalk.green("Default Certbot email updated."));
 
         break;
       }
@@ -1030,10 +1829,6 @@ program
 
         cliConfig.defaultPocketBaseVersion = version || (await getLatestPocketBaseVersion());
 
-        await saveCliConfig(cliConfig);
-
-        console.log(chalk.green("Default PocketBase version updated."));
-
         break;
       }
       case "setLogging": {
@@ -1048,11 +1843,48 @@ program
 
         cliConfig.completeLogging = enableLogging;
 
-        await saveCliConfig(cliConfig);
-
         completeLogging = enableLogging;
 
         console.log(chalk.green(`Complete logging is now ${enableLogging ? "enabled" : "disabled"}.`));
+
+        break;
+      }
+      case "setApiEnabled": {
+        const { apiEnabled } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "apiEnabled",
+            message: "Enable API communication mode (allows external API server to call internal functions)?",
+            default: cliConfig.api.enabled,
+          },
+        ]);
+
+        cliConfig.api.enabled = apiEnabled;
+
+        console.log(chalk.green(`API communication mode is now ${apiEnabled ? "enabled" : "disabled"}.`));
+
+        break;
+      }
+      case "setApiSecret": {
+        const { newSecret } = await inquirer.prompt([
+          {
+            type: "password",
+            mask: "*",
+            name: "newSecret",
+            message: "Enter new API internal secret (min 16 chars, leave blank to generate):",
+            validate: (input) => input === "" || input.length >= 16 || "Secret must be at least 16 characters or blank to auto-generate.",
+          },
+        ]);
+
+        if (newSecret) {
+          cliConfig.api.secret = newSecret;
+        } else {
+          cliConfig.api.secret = `pbmanager-internal-secret-${Date.now().toString(36)}${Math.random().toString(36).substring(2)}`;
+
+          console.log(chalk.blue("New API internal secret generated."));
+        }
+
+        console.log(chalk.green("API internal secret updated."));
 
         break;
       }
@@ -1060,11 +1892,17 @@ program
         console.log(chalk.cyan("Current CLI Configuration:"));
         console.log(JSON.stringify(cliConfig, null, 2));
 
-        break;
+        return;
       case "exit":
         console.log(chalk.blue("Exiting configuration."));
 
-        break;
+        return;
+    }
+
+    await saveCliConfig(cliConfig);
+
+    if (action !== "setLogging" && action !== "viewConfig" && action !== "exit") {
+      console.log(chalk.green("Configuration updated."));
     }
   });
 
@@ -1076,10 +1914,14 @@ program
     console.log(chalk.bold.cyan("Starting PocketBase Manager Setup..."));
 
     await ensureBaseSetup();
-    await downloadPocketBaseIfNotExists(options.version);
 
-    console.log(chalk.bold.green("Setup complete!"));
-    console.log(chalk.blue("You can now add your first PocketBase instance using: sudo pb-manager add"));
+    const dlResult = await downloadPocketBaseIfNotExists(options.version);
+    if (dlResult && dlResult.success === false) {
+      console.error(chalk.red(`PocketBase download failed: ${dlResult.message}`));
+    } else {
+      console.log(chalk.bold.green("Setup complete!"));
+      console.log(chalk.blue("You can now add your first PocketBase instance using: sudo pb-manager add"));
+    }
   });
 
 program
@@ -1096,10 +1938,15 @@ program
         console.log(chalk.yellow("PocketBase executable not found. Running setup..."));
       }
 
-      await downloadPocketBaseIfNotExists();
+      const dlResult = await downloadPocketBaseIfNotExists();
+      if (dlResult && dlResult.success === false) {
+        console.error(chalk.red(`PocketBase download failed: ${dlResult.message}. Cannot add instance.`));
+
+        return;
+      }
 
       if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
-        console.error(chalk.red("PocketBase download failed. Cannot add instance."));
+        console.error(chalk.red("PocketBase download failed after attempt. Cannot add instance."));
 
         return;
       }
@@ -1893,8 +2740,8 @@ program
   .description("List all managed PocketBase instances")
   .option("--json", "Output in JSON format")
   .action(async (options) => {
-    const config = await getInstancesConfig();
-    if (Object.keys(config.instances).length === 0) {
+    const instancesList = await _internalListInstances();
+    if (instancesList.length === 0) {
       if (options.json) {
         console.log(JSON.stringify([], null, 2));
       } else {
@@ -1905,90 +2752,22 @@ program
     }
 
     if (options.json) {
-      const pm2Statuses = {};
-
-      try {
-        const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
-        if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
-          const pm2List = JSON.parse(pm2ListRaw.stdout);
-          for (const proc of pm2List) {
-            if (proc.name.startsWith("pb-")) {
-              pm2Statuses[proc.name.substring(3)] = proc.pm2_env.status;
-            }
-          }
-        }
-      } catch (e) {}
-
-      const output = [];
-      for (const name in config.instances) {
-        const inst = config.instances[name];
-
-        let certExpiry = "-";
-
-        if (inst.useHttps) {
-          certExpiry = await getCertExpiryDays(inst.domain);
-        }
-
-        const status = pm2Statuses[name] || "UNKNOWN";
-        const protocol = inst.useHttps ? "https" : "http";
-        const publicUrl = `${protocol}://${inst.domain}`;
-
-        output.push({
-          name,
-          domain: inst.domain,
-          protocol,
-          publicUrl: `${publicUrl}/_/`,
-          internalPort: inst.port,
-          dataDirectory: inst.dataDir,
-          pm2Status: status,
-          adminURL: `http://127.0.0.1:${inst.port}/_/`,
-          certExpiryDays: certExpiry,
-        });
-      }
-
-      console.log(JSON.stringify(output, null, 2));
-
+      console.log(JSON.stringify(instancesList, null, 2));
       return;
     }
 
     console.log(chalk.bold.cyan("Managed PocketBase Instances:"));
 
-    const pm2Statuses = {};
-
-    try {
-      const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
-      if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
-        const pm2List = JSON.parse(pm2ListRaw.stdout);
-        for (const proc of pm2List) {
-          if (proc.name.startsWith("pb-")) {
-            pm2Statuses[proc.name.substring(3)] = proc.pm2_env.status;
-          }
-        }
-      }
-    } catch (e) {}
-
-    for (const name in config.instances) {
-      const inst = config.instances[name];
-
-      let certExpiry = "-";
-
-      if (inst.useHttps) {
-        certExpiry = await getCertExpiryDays(inst.domain);
-      }
-
-      const status = pm2Statuses[name] || "UNKNOWN";
-      const protocol = inst.useHttps ? "https" : "http";
-      const publicUrl = `${protocol}://${inst.domain}`;
-
+    for (const inst of instancesList) {
       console.log(`
-        ${chalk.bold(name)}:
-          Domain: ${chalk.green(inst.domain)} (${protocol})
-          Public URL: ${chalk.green(publicUrl)}/_/
-          Internal Port: ${chalk.yellow(inst.port)}
-          Data Directory: ${inst.dataDir}
-          PM2 Status: ${status === "online" ? chalk.green(status) : chalk.red(status)}
-          Admin URL (local): http://127.0.0.1:${inst.port}/_/
-          Certificate expires in: ${certExpiry} day(s)
+        ${chalk.bold(inst.name)}:
+          Domain: ${chalk.green(inst.domain)} (${inst.protocol})
+          Public URL: ${chalk.green(inst.publicUrl)}
+          Internal Port: ${chalk.yellow(inst.internalPort)}
+          Data Directory: ${inst.dataDirectory}
+          PM2 Status: ${inst.pm2Status === "online" ? chalk.green(inst.pm2Status) : chalk.red(inst.pm2Status)}
+          Admin URL (local): ${inst.adminURL}
+          Certificate expires in: ${inst.certExpiryDays} day(s)
       `);
     }
   });
@@ -2454,9 +3233,110 @@ program
     process.exit(0);
   });
 
+program
+  .command("_internal-api-request", { hidden: true })
+  .description("Internal command for API server communication. Do not use directly.")
+  .requiredOption("--secret <secret>", "Internal API secret")
+  .requiredOption("--action <action>", "Action to perform (e.g., listInstances, addInstance)")
+  .option("--payload <json_payload>", "Base64 encoded JSON payload for the action")
+  .action(async (options) => {
+    let cliConfigForInternalHandling;
+
+    try {
+      cliConfigForInternalHandling = await getCliConfig();
+      completeLogging = cliConfigForInternalHandling.completeLogging || false;
+    } catch (configError) {
+      console.error(JSON.stringify({ success: false, error: "PBManagerInternal: Failed to load CLI config during internal API request execution. Proceeding with caution.", details: configError.message }));
+
+      completeLogging = false;
+      cliConfigForInternalHandling = { api: { secret: options.secret, enabled: true }, completeLogging: false, defaultPocketBaseVersion: FALLBACK_POCKETBASE_VERSION };
+    }
+
+    if (!options.secret) {
+      console.error(JSON.stringify({ success: false, error: "PBManagerInternal: Internal API secret is required for _internal-api-request." }));
+      process.exit(1);
+    }
+
+    let payload = {};
+    if (options.payload) {
+      try {
+        payload = JSON.parse(Buffer.from(options.payload, "base64").toString("utf-8"));
+      } catch (e) {
+        console.error(JSON.stringify({ success: false, error: "PBManagerInternal: Invalid JSON payload.", details: e.message }));
+        process.exit(1);
+      }
+    }
+
+    program.runningCommand = { name: () => "_internal-api-request" };
+
+    try {
+      let result;
+      switch (options.action) {
+        case "listInstances":
+          result = await _internalListInstances();
+          console.log(JSON.stringify({ success: true, data: result }));
+          break;
+        case "addInstance":
+          result = await _internalAddInstance(payload);
+          console.log(JSON.stringify(result));
+          break;
+        case "removeInstance":
+          result = await _internalRemoveInstance(payload);
+          console.log(JSON.stringify(result));
+          break;
+        case "getGlobalStats":
+          result = await _internalGetGlobalStats();
+          console.log(JSON.stringify(result));
+          break;
+        case "getInstanceLogs":
+          result = await _internalGetInstanceLogs(payload);
+          console.log(JSON.stringify(result));
+          break;
+        case "cloneInstance":
+          result = await _internalCloneInstance(payload);
+          console.log(JSON.stringify(result));
+          break;
+        case "resetInstance":
+          result = await _internalResetInstance(payload);
+          console.log(JSON.stringify(result));
+          break;
+        case "resetAdminPassword":
+          result = await _internalResetAdminPassword(payload);
+          console.log(JSON.stringify(result));
+          break;
+        case "renewCertificates":
+          result = await _internalRenewCertificates(payload);
+          console.log(JSON.stringify(result));
+          break;
+        case "updatePocketBaseExecutable":
+          result = await _internalUpdatePocketBaseExecutable();
+          console.log(JSON.stringify(result));
+          break;
+        case "updateEcosystemAndReloadPm2":
+          result = await _internalUpdateEcosystemAndReloadPm2();
+          console.log(JSON.stringify(result));
+          break;
+        case "setDefaultCertbotEmail":
+          result = await _internalSetDefaultCertbotEmail(payload);
+          console.log(JSON.stringify(result));
+          break;
+        default:
+          console.error(JSON.stringify({ success: false, error: `PBManagerInternal: Unknown internal action: ${options.action}` }));
+          process.exit(1);
+      }
+    } catch (error) {
+      console.error(JSON.stringify({ success: false, error: `PBManagerInternal: Error executing internal action ${options.action}: ${error.message}`, stack: completeLogging ? error.stack : undefined }));
+      process.exit(1);
+    }
+  });
+
 program.hook("preAction", async (thisCommand, actionCommand) => {
   currentCommandNameForAudit = actionCommand.name();
   currentCommandArgsForAudit = process.argv.slice(3).join(" ");
+
+  if (actionCommand.name() === "_internal-api-request") {
+    return;
+  }
 
   try {
     await fs.ensureDir(CONFIG_DIR);
@@ -2481,46 +3361,46 @@ program.helpInformation = () => `
   PocketBase Manager (pb-manager)
   A CLI tool to manage multiple PocketBase instances with Nginx, PM2, and Certbot.
 
-  Version: 0.3.1
+  Version: ${pbManagerVersion}
 
   Usage:
     sudo pb-manager <command> [options]
 
   Main Commands:
-    dashboard                       Show interactive dashboard for all PocketBase instances
-    add | create                    Register a new PocketBase instance
-    clone <sourceName> <newName>    Clone an existing instance's data and config to a new one
-    list [--json]                   List all managed PocketBase instances
-    remove <name>                   Remove a PocketBase instance (prompts for data deletion)
-    reset <name>                    Reset a PocketBase instance (delete all data, re-confirm needed)
-    reset-admin <name>              Reset the admin password for a PocketBase instance
+    dashboard                          Show interactive dashboard for all PocketBase instances
+    add | create                       Register a new PocketBase instance
+    clone <sourceName> <newName>       Clone an existing instance's data and config to a new one
+    list [--json]                      List all managed PocketBase instances
+    remove <name>                      Remove a PocketBase instance (prompts for data deletion)
+    reset <name>                       Reset a PocketBase instance (delete all data, re-confirm needed)
+    reset-admin <name>                 Reset the admin password for a PocketBase instance
 
   Instance Management:
-    start <name | all>              Start a specific PocketBase instance via PM2
-    stop <name | all>               Stop a specific PocketBase instance via PM2
-    restart <name | all>            Restart a specific PocketBase instance via PM2
-    logs <name>                     Show logs for a specific PocketBase instance from PM2
+    start <name | all>                 Start a specific PocketBase instance via PM2
+    stop <name | all>                  Stop a specific PocketBase instance via PM2
+    restart <name | all>               Restart a specific PocketBase instance via PM2
+    logs <name>                        Show logs for a specific PocketBase instance from PM2
 
   Setup & Configuration:
-    setup [--version]               Initial setup: creates directories and downloads PocketBase
-    configure                       Set or view CLI configurations (default Certbot email, PB version, logging)
+    setup [--version]                  Initial setup: creates directories and downloads PocketBase
+    configure                          Set or view CLI configurations (default Certbot email, PB version, logging, API)
 
   Updates & Maintenance:
-    renew-certificates [name|all]   Renew SSL certificates using Certbot (use --force to force renewal)
-    update-pocketbase               Update the PocketBase executable and restart all instances
-    update-ecosystem                Regenerate the PM2 ecosystem file and reload PM2
-    update-pb-manager               Update the pb-manager CLI from GitHub
+    renew-certificates <name | all>   Renew SSL certificates using Certbot (use --force to force renewal)
+    update-pocketbase                  Update the PocketBase executable and restart all instances
+    update-ecosystem                   Regenerate the PM2 ecosystem file and reload PM2
+    update-pb-manager                  Update the pb-manager CLI from GitHub
 
   Other:
-    audit                           Show the history of commands executed by this CLI (includes errors)
-    help [command]                  Show help for a specific command
+    audit                              Show the history of commands executed by this CLI (includes errors)
+    help [command]                     Show help for a specific command
 
   Run all commands as root or with sudo.
   
 `;
 
 async function main() {
-  if (process.geteuid && process.geteuid() !== 0) {
+  if (process.argv[2] !== "_internal-api-request" && process.geteuid && process.geteuid() !== 0) {
     console.error(chalk.red("You must run this script as root or with sudo. This is required for managing system services and configurations."));
 
     process.exit(1);
@@ -2531,25 +3411,36 @@ async function main() {
   const cliConfig = await getCliConfig();
   completeLogging = cliConfig.completeLogging || false;
 
-  if (!shell.which("pm2")) {
-    console.error(chalk.red("PM2 is not installed or not in PATH. PM2 is essential for managing PocketBase instances."));
-    console.log(chalk.blue("Please install PM2 globally by running: npm install -g pm2"));
-    console.log(chalk.blue("Then, set it up to start on boot: sudo pm2 startup (and follow instructions)"));
+  if (process.argv[2] !== "_internal-api-request" && process.argv[2] !== "setup" && process.argv[2] !== "configure" && process.argv[2] !== "update-pb-manager") {
+    if (!shell.which("pm2")) {
+      console.error(chalk.red("PM2 is not installed or not in PATH. PM2 is essential for managing PocketBase instances."));
+      console.log(chalk.blue("Please install PM2 globally by running: npm install -g pm2"));
+      console.log(chalk.blue("Then, set it up to start on boot: sudo pm2 startup (and follow instructions)"));
 
-    process.exit(1);
-  }
+      process.exit(1);
+    }
 
-  if (!shell.which("nginx")) {
-    console.warn(chalk.yellow("Nginx is not found in PATH. Nginx is required for reverse proxying and HTTPS."));
-    console.log(chalk.blue("Please install Nginx (e.g., sudo apt install nginx or sudo dnf install nginx)."));
+    if (!shell.which("nginx")) {
+      console.warn(chalk.yellow("Nginx is not found in PATH. Nginx is required for reverse proxying and HTTPS."));
+      console.log(chalk.blue("Please install Nginx (e.g., sudo apt install nginx or sudo dnf install nginx)."));
+    }
   }
 
   await ensureBaseSetup();
-  await program.parseAsync(process.argv);
+
+  const parsedCommand = program.parseAsync(process.argv);
+
+  if (program.commands.find((cmd) => cmd.name() === process.argv[2])) {
+    program.runningCommand = program.commands.find((cmd) => cmd.name() === process.argv[2]);
+  }
+
+  await parsedCommand;
 }
 
 main().catch(async (err) => {
-  console.error(chalk.red("An unexpected error occurred:"), err.message);
+  if (process.argv[2] !== "_internal-api-request") {
+    console.error(chalk.red("An unexpected error occurred:"), err.message);
+  }
 
   await appendAuditLog(currentCommandNameForAudit, currentCommandArgsForAudit, err);
 
@@ -2557,7 +3448,7 @@ main().catch(async (err) => {
     completeLogging: false,
   }));
 
-  if (err.stack && (cliConfig.completeLogging || process.env.DEBUG)) {
+  if (err.stack && (cliConfig.completeLogging || process.env.DEBUG) && process.argv[2] !== "_internal-api-request") {
     console.error(err.stack);
   }
 
