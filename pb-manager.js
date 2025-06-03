@@ -36,13 +36,14 @@ const PB_MANAGER_SCRIPT_NAME = "pb-manager.js";
 const DEFAULT_INSTALL_PATH_PB_MANAGER = "/opt/pb-manager/pb-manager.js";
 const POCKETBASE_DOWNLOAD_LOCK_FILENAME = ".download.lock";
 
+const NGINX_GLOBAL_CONF_PATH = "/etc/nginx/nginx.conf";
 let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.5.1";
+const pbManagerVersion = "0.5.2";
 
-async function safeRunCommand(command, args = [], errorMessage, ignoreError = false, options = {}) {
+async function safeRunCommand(command, args, errorMessage, ignoreError = false, options = {}) {
   return new Promise((resolve, reject) => {
     if (completeLogging) {
       console.log(chalk.yellow(`Executing: ${command} ${args.join(" ")}`));
@@ -375,7 +376,7 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
   } catch (e) {
     if (e.code === "EEXIST") {
       if (interactive) {
-        console.log(chalk.yellow("Another PocketBase download process may be active. Please wait or clear the lock file if stuck: " + POCKETBASE_DOWNLOAD_LOCK_PATH));
+        console.log(chalk.yellow(`Another PocketBase download process may be active. Please wait or clear the lock file if stuck: ${POCKETBASE_DOWNLOAD_LOCK_PATH}`));
       }
       await new Promise((resolve) => setTimeout(resolve, 3000));
       if (await fs.pathExists(POCKETBASE_EXEC_PATH)) {
@@ -448,7 +449,7 @@ async function updatePm2EcosystemFile() {
     });
   }
   const ecosystemContent = `module.exports = { apps: ${JSON.stringify(apps, null, 2)} };`;
-  const tempEcosystemFile = PM2_ECOSYSTEM_FILE + `.${Date.now()}.tmp`;
+  const tempEcosystemFile = `${PM2_ECOSYSTEM_FILE}.${Date.now()}.tmp`;
   await fs.writeFile(tempEcosystemFile, ecosystemContent);
   await fs.rename(tempEcosystemFile, PM2_ECOSYSTEM_FILE);
 
@@ -471,6 +472,103 @@ async function reloadPm2(specificInstanceName = null) {
     const message = `Failed to reload PM2: ${error.message}`;
     console.error(chalk.red(message));
     return { success: false, message, error };
+  }
+}
+
+async function addClientMaxBodyToHttpBlockIfMissing() {
+  const clientMaxBodySetting = `client_max_body_size ${NGINX_DEFAULT_MAX_BODY_SIZE};`;
+
+  try {
+    if (!(await fs.pathExists(NGINX_GLOBAL_CONF_PATH))) {
+      console.log(chalk.yellow(`${NGINX_GLOBAL_CONF_PATH} not found. Skipping modification.`));
+      return { success: false, message: `${NGINX_GLOBAL_CONF_PATH} not found.` };
+    }
+
+    const backupPath = `${NGINX_GLOBAL_CONF_PATH}.pbmanager_bak_${Date.now()}`;
+    await safeRunCommand("sudo", ["cp", NGINX_GLOBAL_CONF_PATH, backupPath], `Failed to backup ${NGINX_GLOBAL_CONF_PATH}`);
+    console.log(chalk.blue(`Backed up ${NGINX_GLOBAL_CONF_PATH} to ${backupPath}`));
+
+    const { stdout: originalContent } = await safeRunCommand("sudo", ["cat", NGINX_GLOBAL_CONF_PATH]);
+    const lines = originalContent.split("\n");
+
+    let httpBlockStartIndex = -1;
+    let inHttpBlock = false;
+    let braceCount = 0;
+    let alreadySetCorrectly = false;
+    let foundWithDifferentValue = false;
+    let modified = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmedLine = line.trim();
+
+      if (!inHttpBlock) {
+        if (trimmedLine.startsWith("http") && trimmedLine.endsWith("{")) {
+          inHttpBlock = true;
+          httpBlockStartIndex = i;
+          braceCount = 1;
+        }
+      } else {
+        if (trimmedLine.includes("{")) {
+          braceCount++;
+        }
+        if (trimmedLine.includes("}")) {
+          braceCount--;
+        }
+
+        if (trimmedLine.startsWith("client_max_body_size")) {
+          if (trimmedLine === clientMaxBodySetting) {
+            console.log(chalk.green(`'${clientMaxBodySetting}' is already correctly set in the http block of ${NGINX_GLOBAL_CONF_PATH}.`));
+            alreadySetCorrectly = true;
+            break;
+          }
+          console.log(chalk.yellow(`Found 'client_max_body_size' in the http block of ${NGINX_GLOBAL_CONF_PATH} with a different value: "${trimmedLine}".`));
+          console.log(chalk.yellow("To avoid conflicts, this script will not modify it. Please check your Nginx configuration manually if needed."));
+          foundWithDifferentValue = true;
+          break;
+        }
+
+        if (braceCount === 0) {
+          inHttpBlock = false;
+          if (httpBlockStartIndex !== -1 && !alreadySetCorrectly && !foundWithDifferentValue) {
+            const indentation = `${lines[httpBlockStartIndex].match(/^(\s*)/)[0]}  `;
+            lines.splice(httpBlockStartIndex + 1, 0, `${indentation}${clientMaxBodySetting}`);
+            modified = true;
+            console.log(chalk.yellow(`'${clientMaxBodySetting}' was not found in the http block. Adding it.`));
+          }
+          httpBlockStartIndex = -1;
+        }
+      }
+    }
+
+    if (alreadySetCorrectly || foundWithDifferentValue) {
+      return { success: true, message: "Global Nginx config checked. No automatic changes made due to existing settings." };
+    }
+
+    if (!modified && inHttpBlock && httpBlockStartIndex !== -1) {
+      const indentation = `${lines[httpBlockStartIndex].match(/^(\s*)/)[0]}  `;
+      lines.splice(httpBlockStartIndex + 1, 0, `${indentation}${clientMaxBodySetting}`);
+      modified = true;
+      console.log(chalk.yellow(`'${clientMaxBodySetting}' was not found in the http block (reached end of file). Adding it.`));
+    }
+
+    if (!modified && httpBlockStartIndex === -1 && !inHttpBlock) {
+      console.log(chalk.red(`Could not find the 'http {' block in ${NGINX_GLOBAL_CONF_PATH}. Cannot add '${clientMaxBodySetting}'.`));
+      return { success: false, message: "Http block not found in global Nginx config." };
+    }
+
+    if (modified) {
+      const tempNginxGlobalConfPath = `/tmp/nginx.conf.pbmanager.${Date.now()}`;
+      await fs.writeFile(tempNginxGlobalConfPath, lines.join("\n"));
+      await safeRunCommand("sudo", ["mv", tempNginxGlobalConfPath, NGINX_GLOBAL_CONF_PATH], `Failed to update ${NGINX_GLOBAL_CONF_PATH}`);
+      console.log(chalk.green(`${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}' in the http block.`));
+      return { success: true, message: `${NGINX_GLOBAL_CONF_PATH} updated.` };
+    }
+    console.log(chalk.blue(`No changes made to ${NGINX_GLOBAL_CONF_PATH} regarding '${clientMaxBodySetting}' in the http block.`));
+    return { success: true, message: "No changes needed or made to global Nginx config http block." };
+  } catch (error) {
+    console.error(chalk.red(`Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`));
+    return { success: false, message: `Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`, error };
   }
 }
 
@@ -595,6 +693,33 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
       throw new Error(errorMsg);
     }
   }
+
+  if (maxBody20Mb) {
+    console.log(chalk.yellow("\nNote: For some Nginx versions, 'client_max_body_size' in server/location blocks might not be fully effective."));
+    console.log(chalk.yellow(`It may also need to be set in the main 'http' block of your Nginx configuration (typically ${NGINX_GLOBAL_CONF_PATH}).`));
+
+    const { confirmAddToHttpBlock } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmAddToHttpBlock",
+        message: `Do you want to attempt to add 'client_max_body_size ${NGINX_DEFAULT_MAX_BODY_SIZE};' to the http block in ${NGINX_GLOBAL_CONF_PATH} if it's not already present? (A backup will be created. If it's present with a different value, it will NOT be changed.)`,
+        default: false,
+      },
+    ]);
+
+    if (confirmAddToHttpBlock) {
+      const httpBlockUpdateResult = await addClientMaxBodyToHttpBlockIfMissing();
+      if (httpBlockUpdateResult.success) {
+        console.log(chalk.green("Global Nginx config check/update process for http block completed."));
+      } else {
+        console.log(chalk.red("Global Nginx config check/update process for http block encountered an issue. Please check manually."));
+        if (httpBlockUpdateResult.message) {
+          console.log(chalk.red(`Details: ${httpBlockUpdateResult.message}`));
+        }
+      }
+    }
+  }
+
   return { success: true, message: `Nginx config generated for ${instanceName} at ${nginxConfPath}`, path: nginxConfPath };
 }
 
@@ -759,7 +884,7 @@ async function getDirectorySize(dir) {
   try {
     const result = await safeRunCommand("du", ["-sb", dir], `Failed to get size of ${dir} with du`, true, { silent: true });
     if (result.code === 0 && result.stdout) {
-      return parseInt(result.stdout.split(/\s+/)[0], 10);
+      return Number.parseInt(result.stdout.split(/\s+/)[0], 10);
     }
   } catch (e) {
     if (completeLogging) {
@@ -964,7 +1089,7 @@ async function _internalGetGlobalStats() {
 async function _internalGetInstanceLogs(payload) {
   const { name } = payload;
   let { lines = 100 } = payload;
-  lines = Math.min(Math.max(1, parseInt(lines, 10) || 100), 5000);
+  lines = Math.min(Math.max(1, Number.parseInt(lines, 10) || 100), 5000);
 
   if (!name) {
     return { success: false, error: "Instance name is required for logs.", messages: ["Instance name is required for logs."] };
@@ -2251,7 +2376,7 @@ program
     try {
       const [scriptResponse, checksumResponse] = await Promise.all([axios.get(SCRIPT_URL, { responseType: "text" }), axios.get(CHECKSUM_URL, { responseType: "text" }).catch(() => null)]);
       const newScriptContent = scriptResponse.data;
-      if (checksumResponse && checksumResponse.data) {
+      if (checksumResponse?.data) {
         const expectedChecksum = checksumResponse.data.trim().split(" ")[0];
         const hash = crypto.createHash("sha256");
         hash.update(newScriptContent);
