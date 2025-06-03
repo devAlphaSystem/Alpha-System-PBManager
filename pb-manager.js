@@ -40,7 +40,7 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.5.0";
+const pbManagerVersion = "0.5.1";
 
 async function safeRunCommand(command, args = [], errorMessage, ignoreError = false, options = {}) {
   return new Promise((resolve, reject) => {
@@ -169,6 +169,9 @@ async function appendAuditLog(command, details, error = null) {
 
   try {
     await fs.ensureDir(CONFIG_DIR);
+    if (!(await fs.pathExists(auditLogPath))) {
+      await fs.writeFile(auditLogPath, "", { mode: 0o600 });
+    }
     await fs.appendFile(auditLogPath, logEntry);
   } catch (e) {
     if (completeLogging) {
@@ -476,64 +479,84 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
-    add_header X-XSS-Protection "1; mode=block" always;`;
+    add_header X-XSS-Protection "1; mode=block" always;
+  `;
   const clientMaxBody = maxBody20Mb ? `client_max_body_size ${NGINX_DEFAULT_MAX_BODY_SIZE};` : "";
   const http2Suffix = useHttp2 ? " http2" : "";
   let configContent;
 
   if (useHttps) {
     configContent = `
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
+      server {
+        listen 80;
+        listen [::]:80;
+        server_name ${domain};
+        location / {
+          return 301 https://$host$request_uri;
+        }
+      }
 
-server {
-    server_name ${domain};
-    ${securityHeaders}
-    location / {
+      server {
+        server_name ${domain};
         ${clientMaxBody}
-        proxy_pass http://127.0.0.1:${port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_cache_bypass $http_upgrade;
-    }
-    listen 443 ssl${http2Suffix};
-    listen [::]:443 ssl${http2Suffix};
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparam.pem;
-}`;
+        
+        ${securityHeaders}
+
+        location / {
+          ${clientMaxBody}
+
+          proxy_pass http://127.0.0.1:${port};
+          proxy_http_version 1.1;
+
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection 'upgrade';
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Real-IP $remote_addr;
+
+          proxy_cache_bypass $http_upgrade;
+        }
+
+        listen 443 ssl${http2Suffix};
+        listen [::]:443 ssl${http2Suffix};
+
+        ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+
+        include /etc/letsencrypt/options-ssl-nginx.conf;
+        
+        ssl_dhparam /etc/letsencrypt/ssl-dhparam.pem;
+      }
+    `;
   } else {
     configContent = `
-server {
-    server_name ${domain};
-    ${securityHeaders}
-    location / {
+      server {
+        server_name ${domain};
         ${clientMaxBody}
-        proxy_pass http://127.0.0.1:${port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_cache_bypass $http_upgrade;
-    }
-    listen 80${http2Suffix};
-    listen [::]:80${http2Suffix};
-}`;
+
+        ${securityHeaders}
+
+        location / {
+          ${clientMaxBody}
+
+          proxy_pass http://127.0.0.1:${port};
+          proxy_http_version 1.1;
+
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection 'upgrade';
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Real-IP $remote_addr;
+          
+          proxy_cache_bypass $http_upgrade;
+        }
+
+        listen 80${http2Suffix};
+        listen [::]:80${http2Suffix};
+      }
+    `;
   }
 
   let nginxConfPath;

@@ -131,7 +131,7 @@ check_distro() {
 update_system_packages() {
   info "Updating package lists and system (this may take a moment for Arch)..."
   if [ "$PKG_MANAGER" = "pacman" ]; then
-    if pacman -Syu --noconfirm >> "${LOG_FILE}" 2>&1; then
+    if pacman -Sy --noconfirm >> "${LOG_FILE}" 2>&1; then
       PACMAN_SYU_DONE=1
     else
       error "Failed to update system via pacman."
