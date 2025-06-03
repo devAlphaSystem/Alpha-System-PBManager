@@ -453,7 +453,9 @@ async function updatePm2EcosystemFile() {
   await fs.writeFile(tempEcosystemFile, ecosystemContent);
   await fs.rename(tempEcosystemFile, PM2_ECOSYSTEM_FILE);
 
-  console.log(chalk.green("PM2 ecosystem file updated."));
+  if (completeLogging) {
+    console.log(chalk.green("PM2 ecosystem file updated."));
+  }
   return { success: true, message: "PM2 ecosystem file updated." };
 }
 
@@ -466,7 +468,9 @@ async function reloadPm2(specificInstanceName = null) {
     }
     await safeRunCommand("pm2", ["save"], "Failed to save PM2 state", true);
     const message = specificInstanceName ? `PM2 process ${PM2_INSTANCE_PREFIX}${specificInstanceName} restarted and PM2 state saved.` : "PM2 ecosystem reloaded and PM2 state saved.";
-    console.log(chalk.green(message));
+    if (completeLogging) {
+      console.log(chalk.green(message));
+    }
     return { success: true, message };
   } catch (error) {
     const message = `Failed to reload PM2: ${error.message}`;
@@ -486,7 +490,9 @@ async function addClientMaxBodyToHttpBlockIfMissing() {
 
     const backupPath = `${NGINX_GLOBAL_CONF_PATH}.pbmanager_bak_${Date.now()}`;
     await safeRunCommand("sudo", ["cp", NGINX_GLOBAL_CONF_PATH, backupPath], `Failed to backup ${NGINX_GLOBAL_CONF_PATH}`);
-    console.log(chalk.blue(`Backed up ${NGINX_GLOBAL_CONF_PATH} to ${backupPath}`));
+    if (completeLogging) {
+      console.log(chalk.blue(`Backed up ${NGINX_GLOBAL_CONF_PATH} to ${backupPath}`));
+    }
 
     const { stdout: originalContent } = await safeRunCommand("sudo", ["cat", NGINX_GLOBAL_CONF_PATH]);
     const lines = originalContent.split("\n");
@@ -518,7 +524,9 @@ async function addClientMaxBodyToHttpBlockIfMissing() {
 
         if (trimmedLine.startsWith("client_max_body_size")) {
           if (trimmedLine === clientMaxBodySetting) {
-            console.log(chalk.green(`'${clientMaxBodySetting}' is already correctly set in the http block of ${NGINX_GLOBAL_CONF_PATH}.`));
+            if (completeLogging) {
+              console.log(chalk.green(`'${clientMaxBodySetting}' is already correctly set in the http block of ${NGINX_GLOBAL_CONF_PATH}.`));
+            }
             alreadySetCorrectly = true;
             break;
           }
@@ -534,7 +542,9 @@ async function addClientMaxBodyToHttpBlockIfMissing() {
             const indentation = `${lines[httpBlockStartIndex].match(/^(\s*)/)[0]}  `;
             lines.splice(httpBlockStartIndex + 1, 0, `${indentation}${clientMaxBodySetting}`);
             modified = true;
-            console.log(chalk.yellow(`'${clientMaxBodySetting}' was not found in the http block. Adding it.`));
+            if (completeLogging) {
+              console.log(chalk.yellow(`'${clientMaxBodySetting}' was not found in the http block. Adding it.`));
+            }
           }
           httpBlockStartIndex = -1;
         }
@@ -549,7 +559,9 @@ async function addClientMaxBodyToHttpBlockIfMissing() {
       const indentation = `${lines[httpBlockStartIndex].match(/^(\s*)/)[0]}  `;
       lines.splice(httpBlockStartIndex + 1, 0, `${indentation}${clientMaxBodySetting}`);
       modified = true;
-      console.log(chalk.yellow(`'${clientMaxBodySetting}' was not found in the http block (reached end of file). Adding it.`));
+      if (completeLogging) {
+        console.log(chalk.yellow(`'${clientMaxBodySetting}' was not found in the http block (reached end of file). Adding it.`));
+      }
     }
 
     if (!modified && httpBlockStartIndex === -1 && !inHttpBlock) {
@@ -561,10 +573,14 @@ async function addClientMaxBodyToHttpBlockIfMissing() {
       const tempNginxGlobalConfPath = `/tmp/nginx.conf.pbmanager.${Date.now()}`;
       await fs.writeFile(tempNginxGlobalConfPath, lines.join("\n"));
       await safeRunCommand("sudo", ["mv", tempNginxGlobalConfPath, NGINX_GLOBAL_CONF_PATH], `Failed to update ${NGINX_GLOBAL_CONF_PATH}`);
-      console.log(chalk.green(`${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}' in the http block.`));
-      return { success: true, message: `${NGINX_GLOBAL_CONF_PATH} updated.` };
+      if (completeLogging) {
+        console.log(chalk.green(`${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}' in the http block.`));
+      }
+      return { success: true, message: `${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}'.` };
     }
-    console.log(chalk.blue(`No changes made to ${NGINX_GLOBAL_CONF_PATH} regarding '${clientMaxBodySetting}' in the http block.`));
+    if (completeLogging) {
+      console.log(chalk.blue(`No changes made to ${NGINX_GLOBAL_CONF_PATH} regarding '${clientMaxBodySetting}' in the http block.`));
+    }
     return { success: true, message: "No changes needed or made to global Nginx config http block." };
   } catch (error) {
     console.error(chalk.red(`Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`));
@@ -710,7 +726,9 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     if (confirmAddToHttpBlock) {
       const httpBlockUpdateResult = await addClientMaxBodyToHttpBlockIfMissing();
       if (httpBlockUpdateResult.success) {
-        console.log(chalk.green("Global Nginx config check/update process for http block completed."));
+        if (completeLogging) {
+          console.log(chalk.green("Global Nginx config check/update process for http block completed."));
+        }
       } else {
         console.log(chalk.red("Global Nginx config check/update process for http block encountered an issue. Please check manually."));
         if (httpBlockUpdateResult.message) {
@@ -754,8 +772,10 @@ async function reloadNginx() {
     if (!reloaded) {
       throw new Error("Could not reload Nginx with systemctl, service, or nginx -s reload.");
     }
-    console.log(chalk.green("Nginx reloaded successfully."));
-    return { success: true, message: "Nginx reloaded successfully." };
+    if (completeLogging) {
+      console.log(chalk.green("Nginx reloaded successfully."));
+    }
+    return { success: true, message: "Nginx reloaded." };
   } catch (error) {
     const errorMsg = `Nginx test failed or reload failed: ${error.message}. Please check Nginx configuration.`;
     console.error(chalk.red(errorMsg));
@@ -1190,16 +1210,23 @@ async function _internalAddInstance(payload) {
     const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, maxBody20Mb };
     config.instances[name] = newInstanceConfig;
     await saveInstancesConfig(config);
-    results.messages.push(`Instance "${name}" configuration saved.`);
+    if (completeLogging) results.messages.push(`Instance "${name}" configuration saved.`);
     results.instance = newInstanceConfig;
     let certbotRanSuccessfully = false;
 
     const nginxResult = await generateNginxConfig(name, domain, port, false, false, maxBody20Mb);
     results.nginxConfigPath = nginxResult.path;
-    results.messages.push(nginxResult.message);
+    if (completeLogging) results.messages.push(nginxResult.message);
+    else if (!nginxResult.success) results.messages.push(nginxResult.message);
+
     const nginxReload1 = await reloadNginx();
-    results.messages.push(nginxReload1.message);
-    if (!nginxReload1.success) throw nginxReload1.error || new Error(nginxReload1.message);
+    if (!nginxReload1.success) {
+      results.messages.push(`Nginx reload failed: ${nginxReload1.message}`);
+      throw nginxReload1.error || new Error(nginxReload1.message);
+    }
+    if (completeLogging) {
+      results.messages.push(nginxReload1.message);
+    }
 
     if (useHttps) {
       await ensureDhParamExists();
@@ -1210,30 +1237,37 @@ async function _internalAddInstance(payload) {
         certbotRanSuccessfully = certbotResult.success;
         if (certbotResult.success) {
           const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, maxBody20Mb);
-          results.messages.push(httpsNginxResult.message);
+          if (completeLogging) results.messages.push(httpsNginxResult.message);
+          else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         } else {
-          results.messages.push("Certbot failed. Nginx remains HTTP-only.");
+          results.messages.push("Certbot failed. Nginx remains HTTP-only. You may need to run Certbot manually.");
         }
       } else {
         const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, maxBody20Mb);
-        results.messages.push(httpsNginxResult.message);
-        results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed.");
+        if (completeLogging) results.messages.push(httpsNginxResult.message);
+        else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
+        results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
       }
     } else {
-      results.messages.push("HTTP-only Nginx config generated (or updated).");
+      if (completeLogging) results.messages.push("HTTP-only Nginx config generated (or updated).");
     }
 
     const nginxReload2 = await reloadNginx();
-    results.messages.push(nginxReload2.message);
-    if (!nginxReload2.success) throw nginxReload2.error || new Error(nginxReload2.message);
+    if (!nginxReload2.success) {
+      results.messages.push(`Nginx final reload failed: ${nginxReload2.message}`);
+      throw nginxReload2.error || new Error(nginxReload2.message);
+    }
+    if (completeLogging) {
+      results.messages.push(nginxReload2.message);
+    }
 
     const pm2UpdateResult = await updatePm2EcosystemFile();
-    results.messages.push(pm2UpdateResult.message);
     if (!pm2UpdateResult.success) throw new Error(pm2UpdateResult.message);
+    if (completeLogging) results.messages.push(pm2UpdateResult.message);
 
     const pm2ReloadResult = await reloadPm2();
-    results.messages.push(pm2ReloadResult.message);
     if (!pm2ReloadResult.success) throw new Error(pm2ReloadResult.message);
+    if (completeLogging) results.messages.push(pm2ReloadResult.message);
 
     results.success = true;
     const finalProtocol = useHttps && certbotRanSuccessfully ? "https" : "http";
@@ -1260,9 +1294,9 @@ async function _internalRemoveInstance(payload) {
     const instanceDataDir = config.instances[name].dataDir;
     try {
       await safeRunCommand("pm2", ["stop", `${PM2_INSTANCE_PREFIX}${name}`], `Stopping ${PM2_INSTANCE_PREFIX}${name}`, true);
-      results.messages.push(`Attempted to stop PM2 process ${PM2_INSTANCE_PREFIX}${name}.`);
+      if (completeLogging) results.messages.push(`Attempted to stop PM2 process ${PM2_INSTANCE_PREFIX}${name}.`);
       await safeRunCommand("pm2", ["delete", `${PM2_INSTANCE_PREFIX}${name}`], `Deleting ${PM2_INSTANCE_PREFIX}${name}`, true);
-      results.messages.push(`Attempted to delete PM2 process ${PM2_INSTANCE_PREFIX}${name}.`);
+      if (completeLogging) results.messages.push(`Attempted to delete PM2 process ${PM2_INSTANCE_PREFIX}${name}.`);
     } catch (e) {
       results.messages.push(`Warning: Could not stop/delete PM2 process ${PM2_INSTANCE_PREFIX}${name} (maybe not running/exists): ${e.message}`);
     }
@@ -1274,7 +1308,7 @@ async function _internalRemoveInstance(payload) {
     if (NGINX_DISTRO_MODE !== "rhel" && (await fs.pathExists(nginxEnabledPath))) {
       try {
         await safeRunCommand("sudo", ["rm", nginxEnabledPath], `Failed to remove Nginx symlink ${nginxEnabledPath}`);
-        results.messages.push(`Removed Nginx symlink ${nginxEnabledPath}.`);
+        if (completeLogging) results.messages.push(`Removed Nginx symlink ${nginxEnabledPath}.`);
       } catch (e) {
         results.messages.push(`Warning: Failed to remove Nginx symlink ${nginxEnabledPath}: ${e.message}`);
       }
@@ -1282,7 +1316,7 @@ async function _internalRemoveInstance(payload) {
     if (await fs.pathExists(nginxConfPath)) {
       try {
         await safeRunCommand("sudo", ["rm", nginxConfPath], `Failed to remove Nginx config ${nginxConfPath}`);
-        results.messages.push(`Removed Nginx config ${nginxConfPath}.`);
+        if (completeLogging) results.messages.push(`Removed Nginx config ${nginxConfPath}.`);
       } catch (e) {
         results.messages.push(`Warning: Failed to remove Nginx config ${nginxConfPath}: ${e.message}`);
       }
@@ -1290,13 +1324,21 @@ async function _internalRemoveInstance(payload) {
 
     delete config.instances[name];
     await saveInstancesConfig(config);
-    results.messages.push(`Instance "${name}" removed from configuration.`);
-    await updatePm2EcosystemFile();
+    if (completeLogging) results.messages.push(`Instance "${name}" removed from configuration.`);
+
+    const pm2UpdateRes = await updatePm2EcosystemFile();
+    if (completeLogging && pm2UpdateRes.success) results.messages.push(pm2UpdateRes.message);
+
+    const nginxReloadRes = await reloadNginx();
+    if (completeLogging && nginxReloadRes.success) results.messages.push(nginxReloadRes.message);
+    else if (!nginxReloadRes.success) results.messages.push(`Nginx reload after removal failed: ${nginxReloadRes.message}`);
+
     try {
       await safeRunCommand("pm2", ["save"], "PM2 save failed", true);
-      results.messages.push("PM2 state saved.");
-    } catch (e) {}
-    await reloadNginx();
+      if (completeLogging) results.messages.push("PM2 state saved.");
+    } catch (e) {
+      if (completeLogging) results.messages.push(`PM2 save failed: ${e.message}`);
+    }
 
     if (payload.deleteData) {
       try {
@@ -1324,7 +1366,7 @@ async function _internalCloneInstance(payload) {
   try {
     await ensureBaseSetup();
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
-      results.messages.push("PocketBase executable not found. Attempting non-interactive download.");
+      if (completeLogging) results.messages.push("PocketBase executable not found. Attempting non-interactive download.");
       const dlResult = await downloadPocketBaseIfNotExists(pocketBaseVersion, false);
       if (dlResult && dlResult.success === false) {
         results.error = `PocketBase executable not found and download failed: ${dlResult.message}`;
@@ -1370,10 +1412,10 @@ async function _internalCloneInstance(payload) {
 
     const newInstanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, newName);
     await fs.ensureDir(path.dirname(newInstanceDataDir));
-    results.messages.push(`Copying data from ${sourceInstance.dataDir} to ${newInstanceDataDir}...`);
+    if (completeLogging) results.messages.push(`Copying data from ${sourceInstance.dataDir} to ${newInstanceDataDir}...`);
     try {
       await fs.copy(sourceInstance.dataDir, newInstanceDataDir);
-      results.messages.push("Data copied successfully.");
+      if (completeLogging) results.messages.push("Data copied successfully.");
     } catch (err) {
       results.error = `Error copying data: ${err.message}`;
       results.messages.push(results.error);
@@ -1383,19 +1425,23 @@ async function _internalCloneInstance(payload) {
     const newInstanceConfig = { name: newName, domain, port, dataDir: newInstanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, maxBody20Mb };
     config.instances[newName] = newInstanceConfig;
     await saveInstancesConfig(config);
-    results.messages.push(`Instance "${newName}" configuration saved.`);
+    if (completeLogging) results.messages.push(`Instance "${newName}" configuration saved.`);
     results.instance = newInstanceConfig;
     let certbotRanSuccessfully = false;
 
     const nginxResultHttp = await generateNginxConfig(newName, domain, port, false, false, maxBody20Mb);
-    results.messages.push(nginxResultHttp.message);
+    if (completeLogging) results.messages.push(nginxResultHttp.message);
+    else if (!nginxResultHttp.success) results.messages.push(nginxResultHttp.message);
     if (nginxResultHttp.path) results.nginxConfigPath = nginxResultHttp.path;
 
     const nginxReload1 = await reloadNginx();
-    results.messages.push(nginxReload1.message);
     if (!nginxReload1.success) {
-      results.error = nginxReload1.error?.message || nginxReload1.message || "Nginx reload after HTTP config failed.";
+      results.messages.push(`Nginx reload after HTTP config failed: ${nginxReload1.message}`);
+      results.error = nginxReload1.error?.message || nginxReload1.message;
       return results;
+    }
+    if (completeLogging) {
+      results.messages.push(nginxReload1.message);
     }
 
     if (useHttps) {
@@ -1407,53 +1453,63 @@ async function _internalCloneInstance(payload) {
         certbotRanSuccessfully = certbotResult.success;
         if (certbotResult.success) {
           const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, maxBody20Mb);
-          results.messages.push(httpsNginxResult.message);
+          if (completeLogging) results.messages.push(httpsNginxResult.message);
+          else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
           if (httpsNginxResult.path) results.nginxConfigPath = httpsNginxResult.path;
         } else {
-          results.messages.push("Certbot failed. Nginx may remain HTTP-only.");
+          results.messages.push("Certbot failed. Nginx may remain HTTP-only. Manual Certbot run may be needed.");
         }
       } else {
         const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, maxBody20Mb);
-        results.messages.push(httpsNginxResult.message);
+        if (completeLogging) results.messages.push(httpsNginxResult.message);
+        else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         if (httpsNginxResult.path) results.nginxConfigPath = httpsNginxResult.path;
         results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
       }
     } else {
-      results.messages.push("HTTP-only Nginx config generated.");
+      if (completeLogging) results.messages.push("HTTP-only Nginx config generated.");
     }
 
     const nginxReload2 = await reloadNginx();
-    results.messages.push(nginxReload2.message);
     if (!nginxReload2.success) {
-      results.error = nginxReload2.error?.message || nginxReload2.message || "Final Nginx reload failed.";
+      results.messages.push(`Final Nginx reload failed: ${nginxReload2.message}`);
+      results.error = nginxReload2.error?.message || nginxReload2.message;
       return results;
+    }
+    if (completeLogging) {
+      results.messages.push(nginxReload2.message);
     }
 
     const pm2UpdateResult = await updatePm2EcosystemFile();
-    results.messages.push(pm2UpdateResult.message);
     if (!pm2UpdateResult.success) {
       results.error = pm2UpdateResult.message || "PM2 ecosystem update failed.";
       return results;
     }
+    if (completeLogging) {
+      results.messages.push(pm2UpdateResult.message);
+    }
 
     const pm2ReloadResult = await reloadPm2();
-    results.messages.push(pm2ReloadResult.message);
     if (!pm2ReloadResult.success) {
       results.error = pm2ReloadResult.message || "PM2 reload failed.";
       return results;
+    }
+    if (completeLogging) {
+      results.messages.push(pm2ReloadResult.message);
     }
 
     if (payload.createAdminCli && payload.adminEmail && payload.adminPassword) {
       const migrationsDir = path.join(newInstanceDataDir, "pb_migrations");
       const adminCreateArgs = ["superuser", "create", payload.adminEmail, payload.adminPassword, "--dir", newInstanceDataDir, "--migrationsDir", migrationsDir];
-      results.messages.push(`Attempting to create additional superuser (admin) account: ${payload.adminEmail}`);
+      if (completeLogging) results.messages.push(`Attempting to create additional superuser (admin) account: ${payload.adminEmail}`);
       try {
         const adminResult = await safeRunCommand(POCKETBASE_EXEC_PATH, adminCreateArgs, "Failed to create superuser (admin) account via CLI for clone.");
         if (adminResult?.stdout?.includes("Successfully created new superuser")) {
-          results.messages.push(adminResult.stdout.trim());
+          if (completeLogging) results.messages.push(adminResult.stdout.trim());
           results.messages.push(`Additional superuser (admin) account for ${payload.adminEmail} created successfully!`);
         } else {
-          results.messages.push(`Admin creation output: ${adminResult.stdout} ${adminResult.stderr}`);
+          if (completeLogging) results.messages.push(`Admin creation output: ${adminResult.stdout} ${adminResult.stderr}`);
+          else results.messages.push(`Admin creation for ${payload.adminEmail} may have failed. Check logs if needed.`);
         }
       } catch (e) {
         results.messages.push(`Additional superuser (admin) account creation via CLI failed: ${e.message}`);
@@ -1484,7 +1540,7 @@ async function _internalResetInstance(payload) {
     }
     const instance = config.instances[name];
     const dataDir = instance.dataDir;
-    results.messages.push(`Stopping and deleting PM2 process for ${PM2_INSTANCE_PREFIX}${name}...`);
+    if (completeLogging) results.messages.push(`Stopping and deleting PM2 process for ${PM2_INSTANCE_PREFIX}${name}...`);
     try {
       await safeRunCommand("pm2", ["stop", `${PM2_INSTANCE_PREFIX}${name}`], `Stopping ${PM2_INSTANCE_PREFIX}${name}`, true);
       await safeRunCommand("pm2", ["delete", `${PM2_INSTANCE_PREFIX}${name}`], `Deleting ${PM2_INSTANCE_PREFIX}${name}`, true);
@@ -1492,7 +1548,7 @@ async function _internalResetInstance(payload) {
       results.messages.push(`Warning: Could not stop/delete PM2 process ${PM2_INSTANCE_PREFIX}${name} (maybe not running/exists): ${e.message}`);
     }
 
-    results.messages.push(`Deleting data directory ${dataDir}...`);
+    if (completeLogging) results.messages.push(`Deleting data directory ${dataDir}...`);
     if (await fs.pathExists(dataDir)) {
       try {
         await fs.remove(dataDir);
@@ -1504,10 +1560,16 @@ async function _internalResetInstance(payload) {
       }
     }
     await fs.ensureDir(dataDir);
-    results.messages.push(`Data directory ${dataDir} recreated.`);
-    await updatePm2EcosystemFile();
-    await reloadPm2();
-    results.messages.push(`Instance "${name}" has been reset and PM2 reloaded.`);
+    if (completeLogging) results.messages.push(`Data directory ${dataDir} recreated.`);
+
+    const pm2UpdateRes = await updatePm2EcosystemFile();
+    if (completeLogging && pm2UpdateRes.success) results.messages.push(pm2UpdateRes.message);
+
+    const pm2ReloadRes = await reloadPm2();
+    if (completeLogging && pm2ReloadRes.success) results.messages.push(pm2ReloadRes.message);
+    else if (!pm2ReloadRes.success) results.messages.push(`PM2 reload after reset failed: ${pm2ReloadRes.message}`);
+
+    if (completeLogging) results.messages.push(`Instance "${name}" services reloaded after reset.`);
 
     if (createAdmin) {
       if (!adminEmail || !adminPassword) {
@@ -1515,21 +1577,22 @@ async function _internalResetInstance(payload) {
       } else {
         const migrationsDir = path.join(dataDir, "pb_migrations");
         const adminCreateArgs = ["superuser", "create", adminEmail, adminPassword, "--dir", dataDir, "--migrationsDir", migrationsDir];
-        results.messages.push(`Attempting to create superuser (admin) account: ${adminEmail}`);
+        if (completeLogging) results.messages.push(`Attempting to create superuser (admin) account: ${adminEmail}`);
         try {
           const adminResult = await safeRunCommand(POCKETBASE_EXEC_PATH, adminCreateArgs, "Failed to create superuser (admin) account via CLI.");
           if (adminResult?.stdout?.includes("Successfully created new superuser")) {
-            results.messages.push(adminResult.stdout.trim());
+            if (completeLogging) results.messages.push(adminResult.stdout.trim());
             results.messages.push(`Superuser (admin) account for ${adminEmail} created successfully!`);
           } else {
-            results.messages.push(`Admin creation output: ${adminResult.stdout} ${adminResult.stderr}`);
+            if (completeLogging) results.messages.push(`Admin creation output: ${adminResult.stdout} ${adminResult.stderr}`);
+            else results.messages.push(`Admin creation for ${adminEmail} may have failed. Check logs if needed.`);
           }
         } catch (e) {
           results.messages.push(`Superuser (admin) account creation via CLI failed: ${e.message}`);
         }
       }
     }
-    results.messages.push(`Starting instance ${PM2_INSTANCE_PREFIX}${name}...`);
+    if (completeLogging) results.messages.push(`Starting instance ${PM2_INSTANCE_PREFIX}${name}...`);
     await safeRunCommand("pm2", ["start", `${PM2_INSTANCE_PREFIX}${name}`], `Starting ${PM2_INSTANCE_PREFIX}${name}`, true);
     results.success = true;
     results.messages.push(`Instance "${name}" reset and started.`);
@@ -1559,17 +1622,17 @@ async function _internalResetAdminPassword(payload) {
     const instance = config.instances[name];
     const dataDir = instance.dataDir;
     const adminUpdateArgs = ["superuser", "update", adminEmail, adminPassword, "--dir", dataDir];
-    results.messages.push(`Attempting to reset admin password for ${adminEmail} on instance ${name}...`);
+    if (completeLogging) results.messages.push(`Attempting to reset admin password for ${adminEmail} on instance ${name}...`);
     const result = await safeRunCommand(POCKETBASE_EXEC_PATH, adminUpdateArgs, "Failed to reset superuser (admin) password via CLI.");
     if (result?.stdout?.includes("Successfully updated superuser")) {
-      results.messages.push(result.stdout.trim());
+      if (completeLogging) results.messages.push(result.stdout.trim());
       results.messages.push(`Superuser (admin) password for ${adminEmail} reset successfully!`);
       results.success = true;
     } else {
       results.error = "Admin password reset command did not confirm success.";
       results.messages.push(results.error);
-      if (result.stdout) results.messages.push(`Stdout: ${result.stdout}`);
-      if (result.stderr) results.messages.push(`Stderr: ${result.stderr}`);
+      if (completeLogging && result.stdout) results.messages.push(`Stdout: ${result.stdout}`);
+      if (completeLogging && result.stderr) results.messages.push(`Stderr: ${result.stderr}`);
     }
   } catch (error) {
     results.messages.push(`Error during internal admin password reset: ${error.message}`);
@@ -1609,16 +1672,21 @@ async function _internalRenewCertificates(payload) {
   }
 
   try {
-    results.messages.push(`Executing: sudo certbot ${certbotArgs.join(" ")}`);
+    if (completeLogging) results.messages.push(`Executing: sudo certbot ${certbotArgs.join(" ")}`);
     await safeRunCommand("sudo", ["certbot", ...certbotArgs], "Certbot renewal command failed.");
-    results.messages.push(baseMessage);
-    results.messages.push("Reloading Nginx to apply any changes...");
+    if (completeLogging) results.messages.push(baseMessage);
+
+    if (completeLogging) results.messages.push("Reloading Nginx to apply any changes...");
     const nginxReloadResult = await reloadNginx();
-    results.messages.push(nginxReloadResult.message);
     if (!nginxReloadResult.success) {
+      results.messages.push(`Nginx reload after cert renewal failed: ${nginxReloadResult.message}`);
       throw nginxReloadResult.error || new Error(nginxReloadResult.message);
     }
+    if (completeLogging) {
+      results.messages.push(nginxReloadResult.message);
+    }
     results.success = true;
+    results.messages.push("Certificate renewal process completed.");
   } catch (error) {
     results.error = `Certificate renewal process failed: ${error.message}`;
     results.messages.push(results.error);
@@ -1636,19 +1704,21 @@ async function _internalUpdatePocketBaseExecutable() {
       results.messages.push(results.error);
       return results;
     }
-    results.messages.push(`Running: ${POCKETBASE_EXEC_PATH} update`);
+    if (completeLogging) results.messages.push(`Running: ${POCKETBASE_EXEC_PATH} update`);
     const updateResult = await safeRunCommand(POCKETBASE_EXEC_PATH, ["update"], "PocketBase update command failed.", false, { cwd: POCKETBASE_BIN_DIR });
-    results.messages.push("PocketBase executable update process finished.");
-    if (updateResult.stdout) results.messages.push(`Stdout: ${updateResult.stdout}`);
-    if (updateResult.stderr) results.messages.push(`Stderr: ${updateResult.stderr}`);
+    if (completeLogging) {
+      results.messages.push("PocketBase executable update process finished.");
+      if (updateResult.stdout) results.messages.push(`Stdout: ${updateResult.stdout}`);
+      if (updateResult.stderr) results.messages.push(`Stderr: ${updateResult.stderr}`);
+    }
 
-    results.messages.push("Restarting all PocketBase instances via PM2...");
+    if (completeLogging) results.messages.push("Restarting all PocketBase instances via PM2...");
     const instancesConf = await getInstancesConfig();
     let allRestarted = true;
     for (const instName in instancesConf.instances) {
       try {
         await safeRunCommand("pm2", ["restart", `${PM2_INSTANCE_PREFIX}${instName}`], `Failed to restart instance ${PM2_INSTANCE_PREFIX}${instName}`);
-        results.messages.push(`Instance ${PM2_INSTANCE_PREFIX}${instName} restarted.`);
+        if (completeLogging) results.messages.push(`Instance ${PM2_INSTANCE_PREFIX}${instName} restarted.`);
       } catch (e) {
         results.messages.push(`Failed to restart instance ${PM2_INSTANCE_PREFIX}${instName}: ${e.message}`);
         allRestarted = false;
@@ -1657,7 +1727,7 @@ async function _internalUpdatePocketBaseExecutable() {
     if (allRestarted) {
       results.messages.push("All instances processed for restarting.");
     } else {
-      results.messages.push("Some instances may not have restarted correctly. Check PM2 logs.");
+      results.messages.push("Some instances may not have restarted correctly. Check PM2 logs and errors above.");
     }
     results.success = true;
   } catch (error) {
@@ -1670,8 +1740,12 @@ async function _internalUpdatePocketBaseExecutable() {
 
 async function _internalUpdateEcosystemAndReloadPm2() {
   try {
-    await updatePm2EcosystemFile();
+    const updateRes = await updatePm2EcosystemFile();
+    if (completeLogging && updateRes.success) console.log(updateRes.message);
+
     const reloadResult = await reloadPm2();
+    if (completeLogging && reloadResult.success) console.log(reloadResult.message);
+
     if (!reloadResult.success) {
       return { success: false, error: "Failed to reload PM2 after ecosystem update.", messages: ["PM2 ecosystem file updated, but PM2 reload failed.", reloadResult.message] };
     }
@@ -1881,7 +1955,7 @@ program
       try {
         const adminCmdResult = await safeRunCommand(POCKETBASE_EXEC_PATH, adminCreateArgs, "Failed to create superuser (admin) account via CLI.");
         if (adminCmdResult?.stdout?.includes("Successfully created new superuser")) {
-          console.log(adminCmdResult.stdout.trim());
+          if (completeLogging) console.log(adminCmdResult.stdout.trim());
         }
         console.log(chalk.green(`Superuser (admin) account for ${adminCredentials.adminEmail} created successfully!`));
         adminCreatedViaCli = true;
@@ -2164,22 +2238,26 @@ async function handlePm2Action(action, instanceNameOrAll) {
   }
 
   const capitalizedAction = action.charAt(0).toUpperCase() + action.slice(1);
-  console.log(chalk.blue(`${capitalizedAction}ing ${targets.length > 1 ? "all managed" : ""} instance(s)...`));
+  if (completeLogging || targets.length === 1) {
+    console.log(chalk.blue(`${capitalizedAction}ing ${targets.length > 1 ? "all managed" : ""} instance(s)...`));
+  }
   let allProcessedSuccessfully = true;
 
   for (const targetName of targets) {
     try {
       await safeRunCommand("pm2", [action, `${PM2_INSTANCE_PREFIX}${targetName}`], `Failed to ${action} instance ${PM2_INSTANCE_PREFIX}${targetName}`);
-      console.log(chalk.green(`Instance ${PM2_INSTANCE_PREFIX}${targetName} ${action}ed.`));
+      if (completeLogging || targets.length === 1) {
+        console.log(chalk.green(`Instance ${PM2_INSTANCE_PREFIX}${targetName} ${action}ed.`));
+      }
     } catch (e) {
       console.error(chalk.red(`Failed to ${action} instance ${PM2_INSTANCE_PREFIX}${targetName}: ${e.message}`));
       allProcessedSuccessfully = false;
     }
   }
 
-  if (allProcessedSuccessfully) {
+  if (allProcessedSuccessfully && targets.length > 1) {
     console.log(chalk.bold.green(`All instances processed for ${action}ing.`));
-  } else {
+  } else if (!allProcessedSuccessfully) {
     console.log(chalk.bold.yellow(`Some instances may not have ${action}ed correctly. Check PM2 logs.`));
   }
 }
@@ -2386,7 +2464,7 @@ program
           console.log(chalk.yellow(`Expected: ${expectedChecksum}, Got: ${downloadedChecksum}`));
           return;
         }
-        console.log(chalk.green("Checksum verified."));
+        if (completeLogging) console.log(chalk.green("Checksum verified."));
       } else {
         console.log(chalk.yellow("Could not fetch checksum. Proceeding without verification."));
       }
@@ -2404,9 +2482,9 @@ program
     if (reinstall) {
       try {
         const installDir = path.dirname(installPath);
-        console.log(chalk.cyan("Running npm install..."));
+        if (completeLogging) console.log(chalk.cyan("Running npm install..."));
         await safeRunCommand("npm", ["install"], "Failed to install dependencies", false, { cwd: installDir });
-        console.log(chalk.green("Dependencies installed."));
+        if (completeLogging) console.log(chalk.green("Dependencies installed."));
       } catch (e) {
         console.error(chalk.red("Failed to install dependencies:"), e.message);
       }
