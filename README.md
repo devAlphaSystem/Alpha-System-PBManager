@@ -4,13 +4,13 @@
 
 It supports Debian-based (like Ubuntu), RHEL-based (like Fedora, CentOS, Oracle Linux), and Arch-based Linux distributions.
 
-**Version: 0.5.0**
+**Version: 0.5.4**
 
 ## Key Features
 
 - **Simplified Instance Management:** Add, remove, clone, reset, start, stop, and restart PocketBase instances.
 - **Automated Setup:** Downloads PocketBase, sets up data directories, and configures system services.
-- **Nginx Integration:** Automatically generates secure Nginx reverse proxy configurations with HTTP/2, security headers, and custom upload limits. Adapts to different Linux distributions (Debian, RHEL, Arch).
+- **Nginx Integration:** Automatically generates secure Nginx reverse proxy configurations with HTTP/2, security headers, and customizable upload limits (client max body size presets or custom). Adapts to different Linux distributions (Debian, RHEL, Arch).
 - **PM2 Integration:** Manages PocketBase processes, ensuring they run continuously and restart on boot/crash.
 - **Certbot for HTTPS:** Automates SSL certificate acquisition and renewal with Let's Encrypt.
 - **Interactive Dashboard:** Monitor instance status, resource usage, and perform quick actions from a terminal UI.

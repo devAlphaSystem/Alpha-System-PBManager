@@ -9,7 +9,6 @@ const chalk = require("chalk");
 const unzipper = require("unzipper");
 const shell = require("shelljs");
 const os = require("node:os");
-const Table = require("cli-table3");
 const prettyBytes = require("pretty-bytes");
 const blessed = require("blessed");
 const contrib = require("blessed-contrib");
@@ -19,8 +18,7 @@ const crypto = require("node:crypto");
 
 const PM2_INSTANCE_PREFIX = "pb-";
 const PM2_STATUS_ONLINE = "online";
-const NGINX_DEFAULT_MAX_BODY_SIZE = "20M";
-const POCKETBASE_FALLBACK_VERSION = "0.28.2";
+const POCKETBASE_FALLBACK_VERSION = "0.28.4";
 const AUDIT_LOG_FILE = "audit.log";
 const CLI_CONFIG_FILE = "cli-config.json";
 const INSTANCES_CONFIG_FILE = "instances.json";
@@ -41,7 +39,7 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.5.2";
+const pbManagerVersion = "0.5.4";
 
 async function safeRunCommand(command, args, errorMessage, ignoreError = false, options = {}) {
   return new Promise((resolve, reject) => {
@@ -479,8 +477,8 @@ async function reloadPm2(specificInstanceName = null) {
   }
 }
 
-async function addClientMaxBodyToHttpBlockIfMissing() {
-  const clientMaxBodySetting = `client_max_body_size ${NGINX_DEFAULT_MAX_BODY_SIZE};`;
+async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
+  const clientMaxBodySetting = `client_max_body_size ${sizeValue};`;
 
   try {
     if (!(await fs.pathExists(NGINX_GLOBAL_CONF_PATH))) {
@@ -588,14 +586,14 @@ async function addClientMaxBodyToHttpBlockIfMissing() {
   }
 }
 
-async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, maxBody20Mb) {
+async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize) {
   const securityHeaders = `
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header X-XSS-Protection "1; mode=block" always;
   `;
-  const clientMaxBody = maxBody20Mb ? `client_max_body_size ${NGINX_DEFAULT_MAX_BODY_SIZE};` : "";
+  const clientMaxBody = clientMaxBodySize ? `client_max_body_size ${clientMaxBodySize};` : "";
   const http2Suffix = useHttp2 ? " http2" : "";
   let configContent;
 
@@ -710,7 +708,7 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     }
   }
 
-  if (maxBody20Mb) {
+  if (clientMaxBodySize) {
     console.log(chalk.yellow("\nNote: For some Nginx versions, 'client_max_body_size' in server/location blocks might not be fully effective."));
     console.log(chalk.yellow(`It may also need to be set in the main 'http' block of your Nginx configuration (typically ${NGINX_GLOBAL_CONF_PATH}).`));
 
@@ -718,13 +716,13 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
       {
         type: "confirm",
         name: "confirmAddToHttpBlock",
-        message: `Do you want to attempt to add 'client_max_body_size ${NGINX_DEFAULT_MAX_BODY_SIZE};' to the http block in ${NGINX_GLOBAL_CONF_PATH} if it's not already present? (A backup will be created. If it's present with a different value, it will NOT be changed.)`,
+        message: `Do you want to attempt to add 'client_max_body_size ${clientMaxBodySize};' to the http block in ${NGINX_GLOBAL_CONF_PATH} if it's not already present? (A backup will be created. If it's present with a different value, it will NOT be changed.)`,
         default: false,
       },
     ]);
 
     if (confirmAddToHttpBlock) {
-      const httpBlockUpdateResult = await addClientMaxBodyToHttpBlockIfMissing();
+      const httpBlockUpdateResult = await addClientMaxBodyToHttpBlockIfMissing(clientMaxBodySize);
       if (httpBlockUpdateResult.success) {
         if (completeLogging) {
           console.log(chalk.green("Global Nginx config check/update process for http block completed."));
@@ -1097,44 +1095,6 @@ async function showDashboard() {
   screen.render();
 }
 
-async function _internalGetGlobalStats() {
-  try {
-    const cliConfig = await getCliConfig();
-    return { success: true, data: { pbManagerVersion, defaultPocketBaseVersion: cliConfig.defaultPocketBaseVersion, pocketBaseExecutablePath: POCKETBASE_EXEC_PATH, configDirectory: CONFIG_DIR, nginxSitesAvailable: NGINX_SITES_AVAILABLE, nginxSitesEnabled: NGINX_SITES_ENABLED, nginxDistroMode: NGINX_DISTRO_MODE, completeLoggingEnabled: completeLogging } };
-  } catch (error) {
-    return { success: false, error: error.message, messages: [error.message] };
-  }
-}
-
-async function _internalGetInstanceLogs(payload) {
-  const { name } = payload;
-  let { lines = 100 } = payload;
-  lines = Math.min(Math.max(1, Number.parseInt(lines, 10) || 100), 5000);
-
-  if (!name) {
-    return { success: false, error: "Instance name is required for logs.", messages: ["Instance name is required for logs."] };
-  }
-  const instancePM2Name = `${PM2_INSTANCE_PREFIX}${name}`;
-  try {
-    const config = await getInstancesConfig();
-    if (!config.instances[name]) {
-      return { success: false, error: `Instance "${name}" not found in configuration.`, messages: [`Instance "${name}" not found in configuration.`] };
-    }
-    const logCommand = `pm2 logs ${instancePM2Name} --lines ${lines} --nostream --raw`;
-    const result = shell.exec(logCommand, { silent: true });
-    let logs = result.stdout || "";
-    if (result.stderr && !result.stderr.includes("process name not found")) {
-      logs += `\n--- STDERR ---\n${result.stderr}`;
-    }
-    if (result.stderr?.includes("process name not found") && result.stdout.trim() === "") {
-      return { success: false, error: `PM2 process ${instancePM2Name} not found or no logs available.`, details: result.stderr, messages: [`PM2 process ${instancePM2Name} not found or no logs available.`] };
-    }
-    return { success: true, data: { name, logs: logs.trim() || "No log output." }, messages: ["Logs retrieved."] };
-  } catch (error) {
-    return { success: false, error: `Failed to get logs for ${instancePM2Name}: ${error.message}`, messages: [`Failed to get logs for ${instancePM2Name}: ${error.message}`] };
-  }
-}
-
 async function _internalListInstances() {
   const config = await getInstancesConfig();
   if (Object.keys(config.instances).length === 0) {
@@ -1169,7 +1129,7 @@ async function _internalListInstances() {
 }
 
 async function _internalAddInstance(payload) {
-  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, maxBody20Mb = true, autoRunCertbot = true, pocketBaseVersion } = payload;
+  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, pocketBaseVersion } = payload;
   const results = { success: false, messages: [], instance: null, nginxConfigPath: null, certbotSuccess: null, error: null };
 
   try {
@@ -1207,14 +1167,14 @@ async function _internalAddInstance(payload) {
 
     const instanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, name);
     await fs.ensureDir(instanceDataDir);
-    const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, maxBody20Mb };
+    const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize };
     config.instances[name] = newInstanceConfig;
     await saveInstancesConfig(config);
     if (completeLogging) results.messages.push(`Instance "${name}" configuration saved.`);
     results.instance = newInstanceConfig;
     let certbotRanSuccessfully = false;
 
-    const nginxResult = await generateNginxConfig(name, domain, port, false, false, maxBody20Mb);
+    const nginxResult = await generateNginxConfig(name, domain, port, false, false, clientMaxBodySize);
     results.nginxConfigPath = nginxResult.path;
     if (completeLogging) results.messages.push(nginxResult.message);
     else if (!nginxResult.success) results.messages.push(nginxResult.message);
@@ -1236,14 +1196,14 @@ async function _internalAddInstance(payload) {
         results.messages.push(`Certbot for ${domain}: ${certbotResult.message}`);
         certbotRanSuccessfully = certbotResult.success;
         if (certbotResult.success) {
-          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, maxBody20Mb);
+          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize);
           if (completeLogging) results.messages.push(httpsNginxResult.message);
           else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         } else {
           results.messages.push("Certbot failed. Nginx remains HTTP-only. You may need to run Certbot manually.");
         }
       } else {
-        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, maxBody20Mb);
+        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize);
         if (completeLogging) results.messages.push(httpsNginxResult.message);
         else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
@@ -1360,7 +1320,7 @@ async function _internalRemoveInstance(payload) {
 }
 
 async function _internalCloneInstance(payload) {
-  const { sourceName, newName, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, maxBody20Mb = true, autoRunCertbot = true, pocketBaseVersion } = payload;
+  const { sourceName, newName, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, pocketBaseVersion } = payload;
   const results = { success: false, messages: [], instance: null, nginxConfigPath: null, certbotSuccess: null, error: null };
 
   try {
@@ -1422,14 +1382,14 @@ async function _internalCloneInstance(payload) {
       return results;
     }
 
-    const newInstanceConfig = { name: newName, domain, port, dataDir: newInstanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, maxBody20Mb };
+    const newInstanceConfig = { name: newName, domain, port, dataDir: newInstanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize };
     config.instances[newName] = newInstanceConfig;
     await saveInstancesConfig(config);
     if (completeLogging) results.messages.push(`Instance "${newName}" configuration saved.`);
     results.instance = newInstanceConfig;
     let certbotRanSuccessfully = false;
 
-    const nginxResultHttp = await generateNginxConfig(newName, domain, port, false, false, maxBody20Mb);
+    const nginxResultHttp = await generateNginxConfig(newName, domain, port, false, false, clientMaxBodySize);
     if (completeLogging) results.messages.push(nginxResultHttp.message);
     else if (!nginxResultHttp.success) results.messages.push(nginxResultHttp.message);
     if (nginxResultHttp.path) results.nginxConfigPath = nginxResultHttp.path;
@@ -1452,7 +1412,7 @@ async function _internalCloneInstance(payload) {
         results.messages.push(`Certbot for ${domain}: ${certbotResult.message}`);
         certbotRanSuccessfully = certbotResult.success;
         if (certbotResult.success) {
-          const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, maxBody20Mb);
+          const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, clientMaxBodySize);
           if (completeLogging) results.messages.push(httpsNginxResult.message);
           else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
           if (httpsNginxResult.path) results.nginxConfigPath = httpsNginxResult.path;
@@ -1460,7 +1420,7 @@ async function _internalCloneInstance(payload) {
           results.messages.push("Certbot failed. Nginx may remain HTTP-only. Manual Certbot run may be needed.");
         }
       } else {
-        const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, maxBody20Mb);
+        const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, clientMaxBodySize);
         if (completeLogging) results.messages.push(httpsNginxResult.message);
         else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         if (httpsNginxResult.path) results.nginxConfigPath = httpsNginxResult.path;
@@ -1868,7 +1828,26 @@ program
       { type: "input", name: "domain", message: "Domain/subdomain for this instance (e.g., app.example.com):", validate: (input) => (input.length > 0 ? true : "Domain cannot be empty.") },
       { type: "number", name: "port", message: "Internal port for this instance (e.g., 8091):", default: 8090 + Math.floor(Math.random() * 100), validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port.") },
       { type: "confirm", name: "useHttp2", message: "Enable HTTP/2 in Nginx config?", default: true },
-      { type: "confirm", name: "maxBody20Mb", message: `Set ${NGINX_DEFAULT_MAX_BODY_SIZE} max body size (client_max_body_size ${NGINX_DEFAULT_MAX_BODY_SIZE}) in Nginx config?`, default: true },
+      {
+        type: "list",
+        name: "clientMaxBodySizeOption",
+        message: "Set 'client_max_body_size' in Nginx config?",
+        choices: [
+          { name: "20MB (images, typical)", value: "20M" },
+          { name: "100MB (videos, larger files)", value: "100M" },
+          { name: "500MB (very large files)", value: "500M" },
+          { name: "Custom", value: "custom" },
+          { name: "None (use Nginx default)", value: null },
+        ],
+        default: "20M",
+      },
+      {
+        type: "input",
+        name: "customClientMaxBodySize",
+        message: "Enter custom max body size (e.g., 1G, 250M):",
+        when: (answers) => answers.clientMaxBodySizeOption === "custom",
+        validate: (input) => (/^\d+(M|G|m|g)$/.test(input) ? true : "Please enter a value like 100M or 1G."),
+      },
     ]);
 
     const config = await getInstancesConfig();
@@ -1886,6 +1865,8 @@ program
         return;
       }
     }
+
+    const clientMaxBodySize = initialAnswers.clientMaxBodySizeOption === "custom" ? initialAnswers.customClientMaxBodySize : initialAnswers.clientMaxBodySizeOption;
 
     let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
     const httpsAnswers = await inquirer.prompt([
@@ -1923,7 +1904,7 @@ program
       useHttps: httpsAnswers.useHttps,
       emailForCertbot: httpsAnswers.useHttps ? emailToUseForCertbot : null,
       useHttp2: initialAnswers.useHttp2,
-      maxBody20Mb: initialAnswers.maxBody20Mb,
+      clientMaxBodySize: clientMaxBodySize,
       autoRunCertbot: httpsAnswers.useHttps ? httpsAnswers.autoRunCertbot : false,
       pocketBaseVersion: cliConfig.defaultPocketBaseVersion,
     };
@@ -2025,7 +2006,26 @@ program
       { type: "input", name: "domain", message: `Domain/subdomain for new instance "${newName}":`, default: `cloned-${sourceInstance.domain}`, validate: (input) => (input.length > 0 ? true : "Domain cannot be empty.") },
       { type: "number", name: "port", message: `Internal port for new instance "${newName}":`, default: sourceInstance.port + 1, validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port.") },
       { type: "confirm", name: "useHttp2", message: "Enable HTTP/2 in Nginx config for new instance?", default: sourceInstance.useHttp2 },
-      { type: "confirm", name: "maxBody20Mb", message: `Set ${NGINX_DEFAULT_MAX_BODY_SIZE} max body size in Nginx config for new instance?`, default: sourceInstance.maxBody20Mb },
+      {
+        type: "list",
+        name: "clientMaxBodySizeOption",
+        message: "Set 'client_max_body_size' in Nginx config for new instance?",
+        choices: [
+          { name: "20MB (images, typical)", value: "20M" },
+          { name: "100MB (videos, larger files)", value: "100M" },
+          { name: "500MB (very large files)", value: "500M" },
+          { name: "Custom", value: "custom" },
+          { name: "None (use Nginx default)", value: null },
+        ],
+        default: sourceInstance.clientMaxBodySize || "20M",
+      },
+      {
+        type: "input",
+        name: "customClientMaxBodySize",
+        message: "Enter custom max body size (e.g., 1G, 250M):",
+        when: (answers) => answers.clientMaxBodySizeOption === "custom",
+        validate: (input) => (/^\d+(M|G|m|g)$/.test(input) ? true : "Please enter a value like 100M or 1G."),
+      },
     ]);
     for (const instName in config.instances) {
       if (config.instances[instName].port === cloneAnswers.port) {
@@ -2037,6 +2037,8 @@ program
         return;
       }
     }
+
+    const clientMaxBodySize = cloneAnswers.clientMaxBodySizeOption === "custom" ? cloneAnswers.customClientMaxBodySize : cloneAnswers.clientMaxBodySizeOption;
 
     let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
     const httpsAnswers = await inquirer.prompt([
@@ -2085,7 +2087,7 @@ program
       useHttps: httpsAnswers.useHttps,
       emailForCertbot: httpsAnswers.useHttps ? emailToUseForCertbot : null,
       useHttp2: cloneAnswers.useHttp2,
-      maxBody20Mb: cloneAnswers.maxBody20Mb,
+      clientMaxBodySize: clientMaxBodySize,
       autoRunCertbot: httpsAnswers.useHttps ? httpsAnswers.autoRunCertbot : false,
       pocketBaseVersion: cliConfig.defaultPocketBaseVersion,
       ...adminPayload,
@@ -2533,7 +2535,7 @@ program.helpInformation = () => `
   Instance Management:
     start <name | all>                 Start a specific PocketBase instance via PM2
     stop <name | all>                  Stop a specific PocketBase instance via PM2
-    restart <name | all>               Restart a specific PocketBase instance via PM2
+    restart <name | all>               Restart a specific PocketBase instance or all instances via PM2
     logs <name>                        Show logs for a specific PocketBase instance from PM2
 
   Setup & Configuration:
