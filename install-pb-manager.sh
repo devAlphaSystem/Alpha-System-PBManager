@@ -385,7 +385,7 @@ setup_pbmanager_script() {
     error "Failed to change directory to ${PB_MANAGER_INSTALL_DIR}."
   fi
 
-  local pb_manager_deps="commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs blessed blessed-contrib cli-table3 pretty-bytes@5.6.0"
+  local pb_manager_deps="commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs"
   info "Required CLI dependencies: ${pb_manager_deps}"
   local install_deps
   read -p "Do you want to install/update these CLI dependencies now? [Y/n]: " install_deps

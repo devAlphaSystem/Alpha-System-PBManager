@@ -1,10 +1,10 @@
 # PocketBase Manager (`pb-manager`)
 
-`pb-manager` is a command-line interface (CLI) tool designed to simplify the management of multiple PocketBase instances on a single Linux server. It automates setup, configuration, and ongoing maintenance tasks, including process management with PM2, reverse proxying with Nginx, SSL certificate handling with Certbot, and provides an interactive dashboard for instance monitoring.
+`pb-manager` is a command-line interface (CLI) tool designed to simplify the management of multiple PocketBase instances on a single Linux server. It automates setup, configuration, and ongoing maintenance tasks, including process management with PM2, reverse proxying with Nginx and SSL certificate handling with Certbot.
 
 It supports Debian-based (like Ubuntu), RHEL-based (like Fedora, CentOS, Oracle Linux), and Arch-based Linux distributions.
 
-**Version: 0.5.4**
+**Version: 0.6.0**
 
 ## Key Features
 
@@ -13,11 +13,9 @@ It supports Debian-based (like Ubuntu), RHEL-based (like Fedora, CentOS, Oracle 
 - **Nginx Integration:** Automatically generates secure Nginx reverse proxy configurations with HTTP/2, security headers, and customizable upload limits (client max body size presets or custom). Adapts to different Linux distributions (Debian, RHEL, Arch).
 - **PM2 Integration:** Manages PocketBase processes, ensuring they run continuously and restart on boot/crash.
 - **Certbot for HTTPS:** Automates SSL certificate acquisition and renewal with Let's Encrypt.
-- **Interactive Dashboard:** Monitor instance status, resource usage, and perform quick actions from a terminal UI.
-- **Cloning & Reset:** Easily clone instances (data and config) or reset instances to a clean state.
+- **Reset:** Easily reset instances to a clean state.
 - **Admin Management:** Assists with initial admin creation and provides a command to reset admin passwords.
 - **Self-Update:** The CLI can update itself to the latest version from GitHub.
-- **Audit Logging:** Keeps a log of all commands executed by the CLI.
 - **DNS Validation & Version Notifications:** Proactive checks and helpful information.
 - **WSL2 Support:** Includes prompts to help enable `systemd` on WSL2 for full service functionality.
 

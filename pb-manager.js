@@ -10,16 +10,13 @@ const unzipper = require("unzipper");
 const shell = require("shelljs");
 const os = require("node:os");
 const prettyBytes = require("pretty-bytes");
-const blessed = require("blessed");
-const contrib = require("blessed-contrib");
 const dns = require("node:dns/promises");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 
 const PM2_INSTANCE_PREFIX = "pb-";
 const PM2_STATUS_ONLINE = "online";
-const POCKETBASE_FALLBACK_VERSION = "0.28.4";
-const AUDIT_LOG_FILE = "audit.log";
+const POCKETBASE_FALLBACK_VERSION = "0.29.3";
 const CLI_CONFIG_FILE = "cli-config.json";
 const INSTANCES_CONFIG_FILE = "instances.json";
 const POCKETBASE_BIN_SUBDIR = "bin";
@@ -39,7 +36,7 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.5.4";
+const pbManagerVersion = "0.6.0";
 
 async function safeRunCommand(command, args, errorMessage, ignoreError = false, options = {}) {
   return new Promise((resolve, reject) => {
@@ -154,31 +151,6 @@ let _latestPocketBaseVersionCache = null;
 let currentCommandNameForAudit = "pb-manager";
 let currentCommandArgsForAudit = "";
 
-async function appendAuditLog(command, details, error = null) {
-  const auditLogPath = path.join(CONFIG_DIR, AUDIT_LOG_FILE);
-  const timestamp = new Date().toISOString();
-  let logEntry;
-
-  if (error) {
-    const errorMessage = String(error.message || error).replace(/\n/g, " ");
-    logEntry = `${timestamp} - ERROR during command: ${command} (Args: ${details || "N/A"}) - Message: ${errorMessage}\n`;
-  } else {
-    logEntry = `${timestamp} - Command: ${command}; Args: ${details || "N/A"}\n`;
-  }
-
-  try {
-    await fs.ensureDir(CONFIG_DIR);
-    if (!(await fs.pathExists(auditLogPath))) {
-      await fs.writeFile(auditLogPath, "", { mode: 0o600 });
-    }
-    await fs.appendFile(auditLogPath, logEntry);
-  } catch (e) {
-    if (completeLogging) {
-      console.log(chalk.red(`Failed to append to audit log: ${e.message}`));
-    }
-  }
-}
-
 async function validateDnsRecords(domain) {
   try {
     const publicIpRes = await axios.get(IPFY_URL, { timeout: 5000 }).catch(() => null);
@@ -264,7 +236,10 @@ async function getLatestPocketBaseVersion(forceRefresh = false) {
     return _latestPocketBaseVersionCache;
   }
   try {
-    const res = await axios.get(GITHUB_API_POCKETBASE_RELEASES, { headers: { "User-Agent": "pb-manager" }, timeout: 5000 });
+    const res = await axios.get(GITHUB_API_POCKETBASE_RELEASES, {
+      headers: { "User-Agent": "pb-manager" },
+      timeout: 5000,
+    });
     if (res.data?.tag_name) {
       _latestPocketBaseVersionCache = res.data.tag_name.replace(/^v/, "");
       return _latestPocketBaseVersionCache;
@@ -281,20 +256,31 @@ async function getLatestPocketBaseVersion(forceRefresh = false) {
   return _latestPocketBaseVersionCache;
 }
 
+async function getInstalledPocketBaseVersion() {
+  if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+    return null;
+  }
+  try {
+    const { stdout } = await safeRunCommand(POCKETBASE_EXEC_PATH, ["--version"], "Failed to get PocketBase version", false, { silent: true });
+    const version = stdout.trim();
+    if (/^\d+\.\d+\.\d+$/.test(version)) {
+      return version;
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function getCliConfig() {
-  const latestVersion = (await getLatestPocketBaseVersion()) || POCKETBASE_FALLBACK_VERSION;
   const defaults = {
     defaultCertbotEmail: null,
-    defaultPocketBaseVersion: latestVersion,
     completeLogging: false,
   };
 
   if (await fs.pathExists(CLI_CONFIG_PATH)) {
     try {
       const config = await fs.readJson(CLI_CONFIG_PATH);
-      if (!config.defaultPocketBaseVersion || typeof config.defaultPocketBaseVersion !== "string" || !/^\d+\.\d+\.\d+$/.test(config.defaultPocketBaseVersion)) {
-        config.defaultPocketBaseVersion = latestVersion;
-      }
       const mergedConfig = { ...defaults, ...config };
       return mergedConfig;
     } catch (e) {
@@ -344,8 +330,7 @@ async function saveInstancesConfig(config) {
 }
 
 async function downloadPocketBaseIfNotExists(versionOverride = null, interactive = true) {
-  const cliConfig = await getCliConfig();
-  const versionToDownload = versionOverride || cliConfig.defaultPocketBaseVersion;
+  const versionToDownload = versionOverride || (await getLatestPocketBaseVersion());
 
   if (!versionOverride && (await fs.pathExists(POCKETBASE_EXEC_PATH))) {
     if (completeLogging && interactive) {
@@ -356,7 +341,14 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
 
   if (await fs.pathExists(POCKETBASE_EXEC_PATH)) {
     if (interactive) {
-      const { confirmOverwrite } = await inquirer.prompt([{ type: "confirm", name: "confirmOverwrite", message: `PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Do you want to remove it and download version ${versionToDownload}?`, default: false }]);
+      const { confirmOverwrite } = await inquirer.prompt([
+        {
+          type: "confirm",
+          name: "confirmOverwrite",
+          message: `PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Do you want to remove it and download version ${versionToDownload}?`,
+          default: false,
+        },
+      ]);
       if (!confirmOverwrite) {
         console.log(chalk.yellow("Download cancelled by user."));
         return { success: false, message: "Download cancelled by user." };
@@ -370,7 +362,9 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
 
   try {
     await fs.ensureDir(POCKETBASE_BIN_DIR);
-    await fs.writeFile(POCKETBASE_DOWNLOAD_LOCK_PATH, String(process.pid), { flag: "wx" });
+    await fs.writeFile(POCKETBASE_DOWNLOAD_LOCK_PATH, String(process.pid), {
+      flag: "wx",
+    });
   } catch (e) {
     if (e.code === "EEXIST") {
       if (interactive) {
@@ -378,9 +372,15 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
       }
       await new Promise((resolve) => setTimeout(resolve, 3000));
       if (await fs.pathExists(POCKETBASE_EXEC_PATH)) {
-        return { success: true, message: "PocketBase executable now exists (likely downloaded by another process)." };
+        return {
+          success: true,
+          message: "PocketBase executable now exists (likely downloaded by another process).",
+        };
       }
-      return { success: false, message: "Download lock held by another process." };
+      return {
+        success: false,
+        message: "Download lock held by another process.",
+      };
     }
     throw e;
   }
@@ -391,7 +391,11 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
   }
 
   try {
-    const response = await axios({ url: downloadUrl, method: "GET", responseType: "stream" });
+    const response = await axios({
+      url: downloadUrl,
+      method: "GET",
+      responseType: "stream",
+    });
     const zipPath = path.join(POCKETBASE_BIN_DIR, "pocketbase.zip");
     const writer = fs.createWriteStream(zipPath);
     response.data.pipe(writer);
@@ -412,7 +416,10 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
     if (completeLogging && interactive) {
       console.log(chalk.green(`PocketBase v${versionToDownload} downloaded and extracted successfully to ${POCKETBASE_EXEC_PATH}.`));
     }
-    return { success: true, message: `PocketBase v${versionToDownload} downloaded.` };
+    return {
+      success: true,
+      message: `PocketBase v${versionToDownload} downloaded.`,
+    };
   } catch (error) {
     if (interactive) {
       console.error(chalk.red(`Error downloading or extracting PocketBase v${versionToDownload}:`), error.message);
@@ -421,7 +428,11 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
       }
     }
     if (!interactive) {
-      return { success: false, message: `Error downloading or extracting PocketBase v${versionToDownload}: ${error.message}`, error };
+      return {
+        success: false,
+        message: `Error downloading or extracting PocketBase v${versionToDownload}: ${error.message}`,
+        error,
+      };
     }
     throw error;
   } finally {
@@ -483,7 +494,10 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
   try {
     if (!(await fs.pathExists(NGINX_GLOBAL_CONF_PATH))) {
       console.log(chalk.yellow(`${NGINX_GLOBAL_CONF_PATH} not found. Skipping modification.`));
-      return { success: false, message: `${NGINX_GLOBAL_CONF_PATH} not found.` };
+      return {
+        success: false,
+        message: `${NGINX_GLOBAL_CONF_PATH} not found.`,
+      };
     }
 
     const backupPath = `${NGINX_GLOBAL_CONF_PATH}.pbmanager_bak_${Date.now()}`;
@@ -550,7 +564,10 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
     }
 
     if (alreadySetCorrectly || foundWithDifferentValue) {
-      return { success: true, message: "Global Nginx config checked. No automatic changes made due to existing settings." };
+      return {
+        success: true,
+        message: "Global Nginx config checked. No automatic changes made due to existing settings.",
+      };
     }
 
     if (!modified && inHttpBlock && httpBlockStartIndex !== -1) {
@@ -564,7 +581,10 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
 
     if (!modified && httpBlockStartIndex === -1 && !inHttpBlock) {
       console.log(chalk.red(`Could not find the 'http {' block in ${NGINX_GLOBAL_CONF_PATH}. Cannot add '${clientMaxBodySetting}'.`));
-      return { success: false, message: "Http block not found in global Nginx config." };
+      return {
+        success: false,
+        message: "Http block not found in global Nginx config.",
+      };
     }
 
     if (modified) {
@@ -574,19 +594,29 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
       if (completeLogging) {
         console.log(chalk.green(`${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}' in the http block.`));
       }
-      return { success: true, message: `${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}'.` };
+      return {
+        success: true,
+        message: `${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}'.`,
+      };
     }
     if (completeLogging) {
       console.log(chalk.blue(`No changes made to ${NGINX_GLOBAL_CONF_PATH} regarding '${clientMaxBodySetting}' in the http block.`));
     }
-    return { success: true, message: "No changes needed or made to global Nginx config http block." };
+    return {
+      success: true,
+      message: "No changes needed or made to global Nginx config http block.",
+    };
   } catch (error) {
     console.error(chalk.red(`Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`));
-    return { success: false, message: `Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`, error };
+    return {
+      success: false,
+      message: `Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`,
+      error,
+    };
   }
 }
 
-async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize) {
+async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize = false) {
   const securityHeaders = `
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options "nosniff" always;
@@ -708,35 +738,25 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     }
   }
 
-  if (clientMaxBodySize) {
-    console.log(chalk.yellow("\nNote: For some Nginx versions, 'client_max_body_size' in server/location blocks might not be fully effective."));
-    console.log(chalk.yellow(`It may also need to be set in the main 'http' block of your Nginx configuration (typically ${NGINX_GLOBAL_CONF_PATH}).`));
-
-    const { confirmAddToHttpBlock } = await inquirer.prompt([
-      {
-        type: "confirm",
-        name: "confirmAddToHttpBlock",
-        message: `Do you want to attempt to add 'client_max_body_size ${clientMaxBodySize};' to the http block in ${NGINX_GLOBAL_CONF_PATH} if it's not already present? (A backup will be created. If it's present with a different value, it will NOT be changed.)`,
-        default: false,
-      },
-    ]);
-
-    if (confirmAddToHttpBlock) {
-      const httpBlockUpdateResult = await addClientMaxBodyToHttpBlockIfMissing(clientMaxBodySize);
-      if (httpBlockUpdateResult.success) {
-        if (completeLogging) {
-          console.log(chalk.green("Global Nginx config check/update process for http block completed."));
-        }
-      } else {
-        console.log(chalk.red("Global Nginx config check/update process for http block encountered an issue. Please check manually."));
-        if (httpBlockUpdateResult.message) {
-          console.log(chalk.red(`Details: ${httpBlockUpdateResult.message}`));
-        }
+  if (clientMaxBodySize && attemptGlobalClientMaxBodySize) {
+    const httpBlockUpdateResult = await addClientMaxBodyToHttpBlockIfMissing(clientMaxBodySize);
+    if (httpBlockUpdateResult.success) {
+      if (completeLogging) {
+        console.log(chalk.green("Global Nginx config check/update process for http block completed."));
+      }
+    } else {
+      console.log(chalk.red("Global Nginx config check/update process for http block encountered an issue. Please check manually."));
+      if (httpBlockUpdateResult.message) {
+        console.log(chalk.red(`Details: ${httpBlockUpdateResult.message}`));
       }
     }
   }
 
-  return { success: true, message: `Nginx config generated for ${instanceName} at ${nginxConfPath}`, path: nginxConfPath };
+  return {
+    success: true,
+    message: `Nginx config generated for ${instanceName} at ${nginxConfPath}`,
+    path: nginxConfPath,
+  };
 }
 
 async function reloadNginx() {
@@ -828,7 +848,14 @@ async function runCertbot(domain, email, isCliCall = true) {
   }
 
   if (isCliCall) {
-    const { confirmCertbotRun } = await inquirer.prompt([{ type: "confirm", name: "confirmCertbotRun", message: `Ready to run Certbot for domain ${domain} with email ${email}. Command: sudo certbot ${certbotArgs.join(" ")}. Proceed?`, default: true }]);
+    const { confirmCertbotRun } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmCertbotRun",
+        message: `Ready to run Certbot for domain ${domain} with email ${email}. Command: sudo certbot ${certbotArgs.join(" ")}. Proceed?`,
+        default: true,
+      },
+    ]);
     if (!confirmCertbotRun) {
       console.log(chalk.yellow("Certbot execution cancelled by user."));
       return { success: false, message: "Certbot execution cancelled by user." };
@@ -848,99 +875,6 @@ async function runCertbot(domain, email, isCliCall = true) {
     }
     return { success: false, message: errorMsg, error };
   }
-}
-
-async function getInstanceUsageAnalytics(instances) {
-  const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
-  let pm2List = [];
-  if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
-    try {
-      pm2List = JSON.parse(pm2ListRaw.stdout);
-    } catch (e) {
-      if (completeLogging) {
-        console.error(chalk.red("Failed to parse pm2 jlist output."));
-      }
-      pm2List = [];
-    }
-  }
-
-  const usage = [];
-  for (const name in instances) {
-    const inst = instances[name];
-    let pm2Proc;
-    for (const proc of pm2List) {
-      if (proc.name === `${PM2_INSTANCE_PREFIX}${name}`) {
-        pm2Proc = proc;
-        break;
-      }
-    }
-    const status = pm2Proc ? pm2Proc.pm2_env.status : "offline";
-    const cpu = pm2Proc?.monit ? pm2Proc.monit.cpu : 0;
-    const mem = pm2Proc?.monit ? pm2Proc.monit.memory : 0;
-    const uptime = pm2Proc?.pm2_env.pm_uptime ? Date.now() - pm2Proc.pm2_env.pm_uptime : 0;
-    const dataDir = inst.dataDir;
-    let dataSize = 0;
-    try {
-      if (await fs.pathExists(dataDir)) {
-        dataSize = await getDirectorySize(dataDir);
-      }
-    } catch (e) {}
-    let httpStatus = "-";
-    try {
-      const url = `http://127.0.0.1:${inst.port}/api/health`;
-      const res = await axios.get(url, { timeout: 1000 }).catch(() => null);
-      httpStatus = res && res.status === 200 ? "OK" : "ERR";
-    } catch (e) {
-      httpStatus = "ERR";
-    }
-    usage.push({ name, domain: inst.domain, port: inst.port, status, cpu, mem, uptime, dataSize, httpStatus, ssl: inst.useHttps ? "Yes" : "No" });
-  }
-  return usage;
-}
-
-async function getDirectorySize(dir) {
-  try {
-    const result = await safeRunCommand("du", ["-sb", dir], `Failed to get size of ${dir} with du`, true, { silent: true });
-    if (result.code === 0 && result.stdout) {
-      return Number.parseInt(result.stdout.split(/\s+/)[0], 10);
-    }
-  } catch (e) {
-    if (completeLogging) {
-      console.warn(chalk.yellow(`Failed to get size with 'du' for ${dir}: ${e.message}. Falling back to recursive method.`));
-    }
-  }
-
-  let total = 0;
-  try {
-    const files = await fs.readdir(dir);
-    for (const file of files) {
-      const filePath = path.join(dir, file);
-      const stat = await fs.stat(filePath);
-      if (stat.isDirectory()) {
-        total += await getDirectorySize(filePath);
-      } else {
-        total += stat.size;
-      }
-    }
-  } catch (e) {
-    if (completeLogging) {
-      console.warn(chalk.yellow(`Error during recursive size calculation for ${dir}: ${e.message}`));
-    }
-    return 0;
-  }
-  return total;
-}
-
-function formatUptime(ms) {
-  if (!ms || ms < 0) return "-";
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ${m % 60}m`;
-  const d = Math.floor(h / 24);
-  return `${d}d ${h % 24}h`;
 }
 
 function getCertExpiryDays(domain) {
@@ -986,115 +920,6 @@ function getCertExpiryDays(domain) {
   });
 }
 
-async function showDashboard() {
-  await ensureBaseSetup();
-  const config = await getInstancesConfig();
-  const instanceNames = Object.keys(config.instances);
-  if (instanceNames.length === 0) {
-    console.log(chalk.yellow("No instances configured yet. Use 'pb-manager add'."));
-    return;
-  }
-
-  const screen = blessed.screen({ smartCSR: true, title: "PocketBase Manager Dashboard" });
-  const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
-  const table = grid.set(0, 0, 10, 12, contrib.table, { keys: true, fg: "white", selectedFg: "white", selectedBg: "blue", interactive: true, label: "PocketBase Instances", width: "100%", height: "100%", border: { type: "line", fg: "cyan" }, columnSpacing: 2, columnWidth: [25, 25, 8, 10, 8, 10, 10, 8, 8, 8] });
-  grid.set(10, 0, 2, 12, blessed.box, { content: " [q] Quit  [r] Refresh  [l] Logs  [s] Start/Stop  [d] Delete", tags: true, style: { fg: "yellow" } });
-
-  function truncateText(text, maxLength) {
-    return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
-  }
-
-  let currentData = [];
-  let selectedIndex = 0;
-
-  async function refreshTable() {
-    try {
-      const usage = await getInstanceUsageAnalytics(config.instances);
-      currentData = usage;
-      const data = [];
-      for (const u of usage) {
-        data.push([truncateText(u.name, 25), truncateText(u.domain, 25), u.port, u.status, u.httpStatus, u.ssl, `${u.cpu}%`, prettyBytes(u.mem), formatUptime(u.uptime), prettyBytes(u.dataSize)]);
-      }
-      table.setData({ headers: ["Name", "Domain", "Port", "Status", "HTTP", "SSL", "CPU", "Mem", "Uptime", "Data"], data });
-      if (data.length > 0) {
-        if (selectedIndex >= data.length) selectedIndex = data.length - 1;
-        if (selectedIndex < 0) selectedIndex = 0;
-        table.rows.select(selectedIndex);
-      }
-      screen.render();
-    } catch (error) {
-      if (completeLogging) console.error(chalk.red("Dashboard refresh error:"), error);
-    }
-  }
-
-  await refreshTable();
-  const interval = setInterval(refreshTable, 2000);
-  table.focus();
-  table.rows.on("select", (_, idx) => {
-    selectedIndex = typeof idx === "number" ? idx : table.rows.selected;
-  });
-  table.rows.on("keypress", (_, key) => {
-    if (key && key.name === "up") {
-      selectedIndex = Math.max(0, table.rows.selected);
-    }
-    if (key && key.name === "down") {
-      selectedIndex = Math.min(currentData.length - 1, table.rows.selected);
-    }
-  });
-
-  const quitDashboard = () => {
-    clearInterval(interval);
-    if (screen && !screen.destroyed) {
-      screen.destroy();
-    }
-    process.exit(0);
-  };
-
-  screen.key(["q", "C-c"], quitDashboard);
-  screen.key(["r"], async () => await refreshTable());
-
-  screen.key(["l"], () => {
-    const idx = table.rows.selected;
-    if (idx >= 0 && idx < currentData.length) {
-      const name = currentData[idx].name;
-      clearInterval(interval);
-      if (screen && !screen.destroyed) screen.destroy();
-      shell.exec(`pm2 logs ${PM2_INSTANCE_PREFIX}${name} --lines 50`);
-      process.exit(0);
-    }
-  });
-
-  screen.key(["s"], async () => {
-    const idx = table.rows.selected;
-    if (idx >= 0 && idx < currentData.length) {
-      const name = currentData[idx].name;
-      const inst = currentData[idx];
-      try {
-        if (inst.status === PM2_STATUS_ONLINE) {
-          await safeRunCommand("pm2", ["stop", `${PM2_INSTANCE_PREFIX}${name}`], `Failed to stop ${name}`);
-        } else {
-          await safeRunCommand("pm2", ["start", `${PM2_INSTANCE_PREFIX}${name}`], `Failed to start ${name}`);
-        }
-        await refreshTable();
-      } catch (e) {
-        if (completeLogging) console.error(chalk.red(`Error start/stop ${name}: ${e.message}`));
-      }
-    }
-  });
-
-  screen.key(["d"], async () => {
-    const idx = table.rows.selected;
-    if (idx >= 0 && idx < currentData.length) {
-      const name = currentData[idx].name;
-      clearInterval(interval);
-      if (screen && !screen.destroyed) screen.destroy();
-      console.log(chalk.yellow(`To delete instance "${name}", please run: pb-manager remove ${name}`));
-      process.exit(0);
-    }
-  });
-  screen.render();
-}
-
 async function _internalListInstances() {
   const config = await getInstancesConfig();
   if (Object.keys(config.instances).length === 0) {
@@ -1134,7 +959,7 @@ async function _internalAddInstance(payload) {
 
   try {
     await ensureBaseSetup();
-    const pbDownloadResult = await downloadPocketBaseIfNotExists(pocketBaseVersion, false);
+    const pbDownloadResult = await downloadPocketBaseIfNotExists(null, false);
     if (pbDownloadResult && pbDownloadResult.success === false && !(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       results.messages.push(`PocketBase executable not found and download failed: ${pbDownloadResult.message}`);
       results.error = "PocketBase download failed";
@@ -1174,7 +999,7 @@ async function _internalAddInstance(payload) {
     results.instance = newInstanceConfig;
     let certbotRanSuccessfully = false;
 
-    const nginxResult = await generateNginxConfig(name, domain, port, false, false, clientMaxBodySize);
+    const nginxResult = await generateNginxConfig(name, domain, port, false, false, clientMaxBodySize, attemptGlobalClientMaxBodySize);
     results.nginxConfigPath = nginxResult.path;
     if (completeLogging) results.messages.push(nginxResult.message);
     else if (!nginxResult.success) results.messages.push(nginxResult.message);
@@ -1196,14 +1021,14 @@ async function _internalAddInstance(payload) {
         results.messages.push(`Certbot for ${domain}: ${certbotResult.message}`);
         certbotRanSuccessfully = certbotResult.success;
         if (certbotResult.success) {
-          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize);
+          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize);
           if (completeLogging) results.messages.push(httpsNginxResult.message);
           else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         } else {
           results.messages.push("Certbot failed. Nginx remains HTTP-only. You may need to run Certbot manually.");
         }
       } else {
-        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize);
+        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize);
         if (completeLogging) results.messages.push(httpsNginxResult.message);
         else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
@@ -1315,175 +1140,6 @@ async function _internalRemoveInstance(payload) {
   } catch (error) {
     results.messages.push(`Error during internal remove instance: ${error.message}`);
     results.error = error.message;
-  }
-  return results;
-}
-
-async function _internalCloneInstance(payload) {
-  const { sourceName, newName, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, pocketBaseVersion } = payload;
-  const results = { success: false, messages: [], instance: null, nginxConfigPath: null, certbotSuccess: null, error: null };
-
-  try {
-    await ensureBaseSetup();
-    if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
-      if (completeLogging) results.messages.push("PocketBase executable not found. Attempting non-interactive download.");
-      const dlResult = await downloadPocketBaseIfNotExists(pocketBaseVersion, false);
-      if (dlResult && dlResult.success === false) {
-        results.error = `PocketBase executable not found and download failed: ${dlResult.message}`;
-        results.messages.push(results.error);
-        return results;
-      }
-      if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
-        results.error = "PocketBase download failed after attempt. Cannot clone instance.";
-        results.messages.push(results.error);
-        return results;
-      }
-    }
-
-    const config = await getInstancesConfig();
-    const sourceInstance = config.instances[sourceName];
-    if (!sourceInstance) {
-      results.error = `Source instance "${sourceName}" not found.`;
-      results.messages.push(results.error);
-      return results;
-    }
-    if (config.instances[newName]) {
-      results.error = `Target instance "${newName}" already exists.`;
-      results.messages.push(results.error);
-      return results;
-    }
-    for (const instName in config.instances) {
-      if (config.instances[instName].port === port) {
-        results.error = `Port ${port} is already in use by instance "${instName}".`;
-        results.messages.push(results.error);
-        return results;
-      }
-      if (config.instances[instName].domain === domain) {
-        results.error = `Domain ${domain} is already in use by instance "${instName}".`;
-        results.messages.push(results.error);
-        return results;
-      }
-    }
-    if (useHttps && !emailForCertbot) {
-      results.error = "Email for Certbot is required when HTTPS is enabled for the clone.";
-      results.messages.push(results.error);
-      return results;
-    }
-
-    const newInstanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, newName);
-    await fs.ensureDir(path.dirname(newInstanceDataDir));
-    if (completeLogging) results.messages.push(`Copying data from ${sourceInstance.dataDir} to ${newInstanceDataDir}...`);
-    try {
-      await fs.copy(sourceInstance.dataDir, newInstanceDataDir);
-      if (completeLogging) results.messages.push("Data copied successfully.");
-    } catch (err) {
-      results.error = `Error copying data: ${err.message}`;
-      results.messages.push(results.error);
-      return results;
-    }
-
-    const newInstanceConfig = { name: newName, domain, port, dataDir: newInstanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize };
-    config.instances[newName] = newInstanceConfig;
-    await saveInstancesConfig(config);
-    if (completeLogging) results.messages.push(`Instance "${newName}" configuration saved.`);
-    results.instance = newInstanceConfig;
-    let certbotRanSuccessfully = false;
-
-    const nginxResultHttp = await generateNginxConfig(newName, domain, port, false, false, clientMaxBodySize);
-    if (completeLogging) results.messages.push(nginxResultHttp.message);
-    else if (!nginxResultHttp.success) results.messages.push(nginxResultHttp.message);
-    if (nginxResultHttp.path) results.nginxConfigPath = nginxResultHttp.path;
-
-    const nginxReload1 = await reloadNginx();
-    if (!nginxReload1.success) {
-      results.messages.push(`Nginx reload after HTTP config failed: ${nginxReload1.message}`);
-      results.error = nginxReload1.error?.message || nginxReload1.message;
-      return results;
-    }
-    if (completeLogging) {
-      results.messages.push(nginxReload1.message);
-    }
-
-    if (useHttps) {
-      await ensureDhParamExists();
-      if (autoRunCertbot) {
-        const certbotResult = await runCertbot(domain, emailForCertbot, false);
-        results.certbotSuccess = certbotResult.success;
-        results.messages.push(`Certbot for ${domain}: ${certbotResult.message}`);
-        certbotRanSuccessfully = certbotResult.success;
-        if (certbotResult.success) {
-          const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, clientMaxBodySize);
-          if (completeLogging) results.messages.push(httpsNginxResult.message);
-          else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
-          if (httpsNginxResult.path) results.nginxConfigPath = httpsNginxResult.path;
-        } else {
-          results.messages.push("Certbot failed. Nginx may remain HTTP-only. Manual Certbot run may be needed.");
-        }
-      } else {
-        const httpsNginxResult = await generateNginxConfig(newName, domain, port, true, useHttp2, clientMaxBodySize);
-        if (completeLogging) results.messages.push(httpsNginxResult.message);
-        else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
-        if (httpsNginxResult.path) results.nginxConfigPath = httpsNginxResult.path;
-        results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
-      }
-    } else {
-      if (completeLogging) results.messages.push("HTTP-only Nginx config generated.");
-    }
-
-    const nginxReload2 = await reloadNginx();
-    if (!nginxReload2.success) {
-      results.messages.push(`Final Nginx reload failed: ${nginxReload2.message}`);
-      results.error = nginxReload2.error?.message || nginxReload2.message;
-      return results;
-    }
-    if (completeLogging) {
-      results.messages.push(nginxReload2.message);
-    }
-
-    const pm2UpdateResult = await updatePm2EcosystemFile();
-    if (!pm2UpdateResult.success) {
-      results.error = pm2UpdateResult.message || "PM2 ecosystem update failed.";
-      return results;
-    }
-    if (completeLogging) {
-      results.messages.push(pm2UpdateResult.message);
-    }
-
-    const pm2ReloadResult = await reloadPm2();
-    if (!pm2ReloadResult.success) {
-      results.error = pm2ReloadResult.message || "PM2 reload failed.";
-      return results;
-    }
-    if (completeLogging) {
-      results.messages.push(pm2ReloadResult.message);
-    }
-
-    if (payload.createAdminCli && payload.adminEmail && payload.adminPassword) {
-      const migrationsDir = path.join(newInstanceDataDir, "pb_migrations");
-      const adminCreateArgs = ["superuser", "create", payload.adminEmail, payload.adminPassword, "--dir", newInstanceDataDir, "--migrationsDir", migrationsDir];
-      if (completeLogging) results.messages.push(`Attempting to create additional superuser (admin) account: ${payload.adminEmail}`);
-      try {
-        const adminResult = await safeRunCommand(POCKETBASE_EXEC_PATH, adminCreateArgs, "Failed to create superuser (admin) account via CLI for clone.");
-        if (adminResult?.stdout?.includes("Successfully created new superuser")) {
-          if (completeLogging) results.messages.push(adminResult.stdout.trim());
-          results.messages.push(`Additional superuser (admin) account for ${payload.adminEmail} created successfully!`);
-        } else {
-          if (completeLogging) results.messages.push(`Admin creation output: ${adminResult.stdout} ${adminResult.stderr}`);
-          else results.messages.push(`Admin creation for ${payload.adminEmail} may have failed. Check logs if needed.`);
-        }
-      } catch (e) {
-        results.messages.push(`Additional superuser (admin) account creation via CLI failed: ${e.message}`);
-      }
-    }
-
-    results.success = true;
-    const finalProtocol = useHttps && certbotRanSuccessfully ? "https" : "http";
-    results.instance.url = `${finalProtocol}://${domain}/_/`;
-    results.messages.push(`Instance "${newName}" cloned and services reloaded. Access at ${results.instance.url}`);
-  } catch (error) {
-    results.messages.push(`Error during internal clone instance: ${error.message}`);
-    results.error = error.message;
-    if (completeLogging) console.error(error.stack);
   }
   return results;
 }
@@ -1707,66 +1363,92 @@ async function _internalUpdateEcosystemAndReloadPm2() {
     if (completeLogging && reloadResult.success) console.log(reloadResult.message);
 
     if (!reloadResult.success) {
-      return { success: false, error: "Failed to reload PM2 after ecosystem update.", messages: ["PM2 ecosystem file updated, but PM2 reload failed.", reloadResult.message] };
+      return {
+        success: false,
+        error: "Failed to reload PM2 after ecosystem update.",
+        messages: ["PM2 ecosystem file updated, but PM2 reload failed.", reloadResult.message],
+      };
     }
-    return { success: true, messages: ["PM2 ecosystem file updated and PM2 reloaded successfully."] };
+    return {
+      success: true,
+      messages: ["PM2 ecosystem file updated and PM2 reloaded successfully."],
+    };
   } catch (error) {
-    return { success: false, error: error.message, messages: [`Error updating ecosystem/reloading PM2: ${error.message}`] };
+    return {
+      success: false,
+      error: error.message,
+      messages: [`Error updating ecosystem/reloading PM2: ${error.message}`],
+    };
   }
 }
 
 async function _internalSetDefaultCertbotEmail(payload) {
   const { email } = payload;
   if (email !== null && typeof email !== "string" && email !== "") {
-    return { success: false, error: "Invalid payload: 'email' must be a valid email string, empty string, or null.", messages: ["Invalid payload for setting Certbot email."] };
+    return {
+      success: false,
+      error: "Invalid payload: 'email' must be a valid email string, empty string, or null.",
+      messages: ["Invalid payload for setting Certbot email."],
+    };
   }
   if (typeof email === "string" && email !== "" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return { success: false, error: "Invalid payload: 'email' must be a valid email format.", messages: ["Invalid email format for Certbot email."] };
+    return {
+      success: false,
+      error: "Invalid payload: 'email' must be a valid email format.",
+      messages: ["Invalid email format for Certbot email."],
+    };
   }
   try {
     const cliConfig = await getCliConfig();
     cliConfig.defaultCertbotEmail = email || null;
     await saveCliConfig(cliConfig);
-    return { success: true, messages: [`Default Certbot email set to ${cliConfig.defaultCertbotEmail || "not set"}.`] };
+    return {
+      success: true,
+      messages: [`Default Certbot email set to ${cliConfig.defaultCertbotEmail || "not set"}.`],
+    };
   } catch (error) {
-    return { success: false, error: error.message, messages: [`Error setting default Certbot email: ${error.message}`] };
+    return {
+      success: false,
+      error: error.message,
+      messages: [`Error setting default Certbot email: ${error.message}`],
+    };
   }
 }
 
 program
-  .command("dashboard")
-  .description("Show interactive dashboard for all PocketBase instances")
-  .action(async () => {
-    await showDashboard();
-  });
-
-program
   .command("configure")
-  .description("Set or view CLI configurations (e.g., default Certbot email, PocketBase version, logging).")
+  .description("Set or view CLI configurations (e.g., default Certbot email, logging).")
   .action(async () => {
     await ensureBaseSetup();
     const cliConfig = await getCliConfig();
-    const choices = [{ name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`, value: "setEmail" }, { name: `Default PocketBase Version (for setup): ${cliConfig.defaultPocketBaseVersion}`, value: "setPbVersion" }, { name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`, value: "setLogging" }, new inquirer.Separator(), { name: "View current JSON config", value: "viewConfig" }, { name: "Exit", value: "exit" }];
+    const choices = [{ name: `Default Certbot Email: ${cliConfig.defaultCertbotEmail || "Not set"}`, value: "setEmail" }, { name: `Enable complete logging: ${cliConfig.completeLogging ? "Yes" : "No"}`, value: "setLogging" }, new inquirer.Separator(), { name: "View current JSON config", value: "viewConfig" }, { name: "Exit", value: "exit" }];
     const { action } = await inquirer.prompt([{ type: "list", name: "action", message: "CLI Configuration:", choices }]);
 
     switch (action) {
       case "setEmail": {
-        const { email } = await inquirer.prompt([{ type: "input", name: "email", message: "Enter new default Certbot email (leave blank to clear):", default: cliConfig.defaultCertbotEmail }]);
+        const { email } = await inquirer.prompt([
+          {
+            type: "input",
+            name: "email",
+            message: "Enter new default Certbot email (leave blank to clear):",
+            default: cliConfig.defaultCertbotEmail,
+          },
+        ]);
         const result = await _internalSetDefaultCertbotEmail({ email });
         for (const msg of result.messages) {
           console.log(result.success ? chalk.green(msg) : chalk.red(msg));
         }
         break;
       }
-      case "setPbVersion": {
-        const { version } = await inquirer.prompt([{ type: "input", name: "version", message: "Enter new default PocketBase version (e.g., 0.22.10):", default: cliConfig.defaultPocketBaseVersion, validate: (input) => (/^(\d+\.\d+\.\d+)$/.test(input) || input === "" ? true : "Please enter a valid version (x.y.z) or leave blank.") }]);
-        cliConfig.defaultPocketBaseVersion = version || (await getLatestPocketBaseVersion());
-        await saveCliConfig(cliConfig);
-        console.log(chalk.green(`Default PocketBase version set to ${cliConfig.defaultPocketBaseVersion}.`));
-        break;
-      }
       case "setLogging": {
-        const { enableLogging } = await inquirer.prompt([{ type: "confirm", name: "enableLogging", message: "Enable complete logging (show all commands and outputs)?", default: cliConfig.completeLogging || false }]);
+        const { enableLogging } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "enableLogging",
+            message: "Enable complete logging (show all commands and outputs)?",
+            default: cliConfig.completeLogging || false,
+          },
+        ]);
         cliConfig.completeLogging = enableLogging;
         await saveCliConfig(cliConfig);
         completeLogging = enableLogging;
@@ -1812,7 +1494,7 @@ program
 
     if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       console.log(chalk.yellow("PocketBase executable not found. Attempting to download..."));
-      const dlResult = await downloadPocketBaseIfNotExists(cliConfig.defaultPocketBaseVersion, true);
+      const dlResult = await downloadPocketBaseIfNotExists(null, true);
       if (!dlResult.success) {
         console.error(chalk.red(`PocketBase download failed: ${dlResult.message}. Cannot add instance.`));
         return;
@@ -1824,10 +1506,31 @@ program
     }
 
     const initialAnswers = await inquirer.prompt([
-      { type: "input", name: "name", message: "Instance name (e.g., my-app, no spaces):", validate: (input) => (/^[a-zA-Z0-9-]+$/.test(input) ? true : "Invalid name format.") },
-      { type: "input", name: "domain", message: "Domain/subdomain for this instance (e.g., app.example.com):", validate: (input) => (input.length > 0 ? true : "Domain cannot be empty.") },
-      { type: "number", name: "port", message: "Internal port for this instance (e.g., 8091):", default: 8090 + Math.floor(Math.random() * 100), validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port.") },
-      { type: "confirm", name: "useHttp2", message: "Enable HTTP/2 in Nginx config?", default: true },
+      {
+        type: "input",
+        name: "name",
+        message: "Instance name (e.g., my-app, no spaces):",
+        validate: (input) => (/^[a-zA-Z0-9-]+$/.test(input) ? true : "Invalid name format."),
+      },
+      {
+        type: "input",
+        name: "domain",
+        message: "Domain/subdomain for this instance (e.g., app.example.com):",
+        validate: (input) => (input.length > 0 ? true : "Domain cannot be empty."),
+      },
+      {
+        type: "number",
+        name: "port",
+        message: "Internal port for this instance (e.g., 8091):",
+        default: 8090 + Math.floor(Math.random() * 100),
+        validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port."),
+      },
+      {
+        type: "confirm",
+        name: "useHttp2",
+        message: "Enable HTTP/2 in Nginx config?",
+        default: true,
+      },
       {
         type: "list",
         name: "clientMaxBodySizeOption",
@@ -1868,18 +1571,65 @@ program
 
     const clientMaxBodySize = initialAnswers.clientMaxBodySizeOption === "custom" ? initialAnswers.customClientMaxBodySize : initialAnswers.clientMaxBodySizeOption;
 
+    let attemptGlobalClientMaxBodySize = false;
+    if (clientMaxBodySize) {
+      console.log(chalk.yellow("\nNote: For some Nginx versions, 'client_max_body_size' in server/location blocks might not be fully effective."));
+      console.log(chalk.yellow(`It may also need to be set in the main 'http' block of your Nginx configuration (typically ${NGINX_GLOBAL_CONF_PATH}).`));
+
+      const { confirmAddToHttpBlock } = await inquirer.prompt([
+        {
+          type: "confirm",
+          name: "confirmAddToHttpBlock",
+          message: `Do you want to attempt to add 'client_max_body_size ${clientMaxBodySize};' to the http block in ${NGINX_GLOBAL_CONF_PATH} if it's not already present? (A backup will be created. If it's present with a different value, it will NOT be changed.)`,
+          default: false,
+        },
+      ]);
+      attemptGlobalClientMaxBodySize = confirmAddToHttpBlock;
+    }
+
     let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
     const httpsAnswers = await inquirer.prompt([
-      { type: "confirm", name: "useHttps", message: "Configure HTTPS (Certbot)?", default: true },
-      { type: "confirm", name: "useDefaultEmail", message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`, default: true, when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail },
-      { type: "input", name: "emailForCertbot", message: "Enter email for Let's Encrypt:", when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail), validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."), default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConfig.defaultCertbotEmail) },
-      { type: "confirm", name: "autoRunCertbot", message: "Attempt to automatically run Certbot now to obtain the SSL certificate?", default: true, when: (answers) => answers.useHttps },
+      {
+        type: "confirm",
+        name: "useHttps",
+        message: "Configure HTTPS (Certbot)?",
+        default: true,
+      },
+      {
+        type: "confirm",
+        name: "useDefaultEmail",
+        message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`,
+        default: true,
+        when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail,
+      },
+      {
+        type: "input",
+        name: "emailForCertbot",
+        message: "Enter email for Let's Encrypt:",
+        when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail),
+        validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."),
+        default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConfig.defaultCertbotEmail),
+      },
+      {
+        type: "confirm",
+        name: "autoRunCertbot",
+        message: "Attempt to automatically run Certbot now to obtain the SSL certificate?",
+        default: true,
+        when: (answers) => answers.useHttps,
+      },
     ]);
 
     if (httpsAnswers.useHttps) {
       const dnsValid = await validateDnsRecords(initialAnswers.domain);
       if (!dnsValid) {
-        const { proceedAnyway } = await inquirer.prompt([{ type: "confirm", name: "proceedAnyway", message: chalk.yellow(`DNS validation failed for ${initialAnswers.domain}. Certbot will likely fail. Do you want to proceed with the setup (you might need to fix DNS and run Certbot manually later, or use HTTP only)?`), default: false }]);
+        const { proceedAnyway } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "proceedAnyway",
+            message: chalk.yellow(`DNS validation failed for ${initialAnswers.domain}. Certbot will likely fail. Do you want to proceed with the setup (you might need to fix DNS and run Certbot manually later, or use HTTP only)?`),
+            default: false,
+          },
+        ]);
         if (!proceedAnyway) {
           console.log(chalk.yellow("Instance setup aborted by user due to DNS issues."));
           return;
@@ -1906,7 +1656,7 @@ program
       useHttp2: initialAnswers.useHttp2,
       clientMaxBodySize: clientMaxBodySize,
       autoRunCertbot: httpsAnswers.useHttps ? httpsAnswers.autoRunCertbot : false,
-      pocketBaseVersion: cliConfig.defaultPocketBaseVersion,
+      attemptGlobalClientMaxBodySize,
     };
 
     const result = await _internalAddInstance(addPayload);
@@ -1921,11 +1671,29 @@ program
     }
 
     let adminCreatedViaCli = false;
-    const { createAdminCli } = await inquirer.prompt([{ type: "confirm", name: "createAdminCli", message: "Do you want to create a superuser (admin) account for this instance via CLI now?", default: true }]);
+    const { createAdminCli } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "createAdminCli",
+        message: "Do you want to create a superuser (admin) account for this instance via CLI now?",
+        default: true,
+      },
+    ]);
     if (createAdminCli) {
       const adminCredentials = await inquirer.prompt([
-        { type: "input", name: "adminEmail", message: "Enter admin email:", validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email.") },
-        { type: "password", name: "adminPassword", message: "Enter admin password (min 8 chars):", mask: "*", validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters.") },
+        {
+          type: "input",
+          name: "adminEmail",
+          message: "Enter admin email:",
+          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+        },
+        {
+          type: "password",
+          name: "adminPassword",
+          message: "Enter admin password (min 8 chars):",
+          mask: "*",
+          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+        },
       ]);
       const instanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, initialAnswers.name);
       const migrationsDir = path.join(instanceDataDir, "pb_migrations");
@@ -1971,158 +1739,6 @@ program
   });
 
 program
-  .command("clone <sourceName> <newName>")
-  .description("Clone an existing PocketBase instance's data and configuration to a new instance.")
-  .action(async (sourceName, newName) => {
-    const cliConfig = await getCliConfig();
-    await ensureBaseSetup();
-
-    if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
-      console.log(chalk.yellow("PocketBase executable not found. Running initial setup..."));
-      const dlResult = await downloadPocketBaseIfNotExists(cliConfig.defaultPocketBaseVersion, true);
-      if (!dlResult.success) {
-        console.error(chalk.red("PocketBase download failed. Cannot clone instance."));
-        return;
-      }
-      if (!(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
-        console.error(chalk.red("PocketBase download seems to have failed. Cannot clone instance."));
-        return;
-      }
-    }
-
-    const config = await getInstancesConfig();
-    const sourceInstance = config.instances[sourceName];
-    if (!sourceInstance) {
-      console.error(chalk.red(`Source instance "${sourceName}" not found.`));
-      return;
-    }
-    if (config.instances[newName]) {
-      console.error(chalk.red(`Target instance "${newName}" already exists.`));
-      return;
-    }
-    console.log(chalk.blue(`Cloning instance "${sourceName}" to "${newName}"...`));
-
-    const cloneAnswers = await inquirer.prompt([
-      { type: "input", name: "domain", message: `Domain/subdomain for new instance "${newName}":`, default: `cloned-${sourceInstance.domain}`, validate: (input) => (input.length > 0 ? true : "Domain cannot be empty.") },
-      { type: "number", name: "port", message: `Internal port for new instance "${newName}":`, default: sourceInstance.port + 1, validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port.") },
-      { type: "confirm", name: "useHttp2", message: "Enable HTTP/2 in Nginx config for new instance?", default: sourceInstance.useHttp2 },
-      {
-        type: "list",
-        name: "clientMaxBodySizeOption",
-        message: "Set 'client_max_body_size' in Nginx config for new instance?",
-        choices: [
-          { name: "20MB (images, typical)", value: "20M" },
-          { name: "100MB (videos, larger files)", value: "100M" },
-          { name: "500MB (very large files)", value: "500M" },
-          { name: "Custom", value: "custom" },
-          { name: "None (use Nginx default)", value: null },
-        ],
-        default: sourceInstance.clientMaxBodySize || "20M",
-      },
-      {
-        type: "input",
-        name: "customClientMaxBodySize",
-        message: "Enter custom max body size (e.g., 1G, 250M):",
-        when: (answers) => answers.clientMaxBodySizeOption === "custom",
-        validate: (input) => (/^\d+(M|G|m|g)$/.test(input) ? true : "Please enter a value like 100M or 1G."),
-      },
-    ]);
-    for (const instName in config.instances) {
-      if (config.instances[instName].port === cloneAnswers.port) {
-        console.error(chalk.red(`Port ${cloneAnswers.port} is already in use by another managed instance.`));
-        return;
-      }
-      if (config.instances[instName].domain === cloneAnswers.domain) {
-        console.error(chalk.red(`Domain ${cloneAnswers.domain} is already in use by another managed instance.`));
-        return;
-      }
-    }
-
-    const clientMaxBodySize = cloneAnswers.clientMaxBodySizeOption === "custom" ? cloneAnswers.customClientMaxBodySize : cloneAnswers.clientMaxBodySizeOption;
-
-    let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
-    const httpsAnswers = await inquirer.prompt([
-      { type: "confirm", name: "useHttps", message: `Configure HTTPS (Certbot) for "${newName}"?`, default: sourceInstance.useHttps },
-      { type: "confirm", name: "useDefaultEmail", message: `Use default email (${cliConfig.defaultCertbotEmail}) for Let's Encrypt?`, default: true, when: (answers) => answers.useHttps && cliConfig.defaultCertbotEmail },
-      { type: "input", name: "emailForCertbot", message: "Enter email for Let's Encrypt:", when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail), validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."), default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? sourceInstance.emailForCertbot : cliConfig.defaultCertbotEmail) },
-      { type: "confirm", name: "autoRunCertbot", message: "Attempt to automatically run Certbot now to obtain the SSL certificate?", default: true, when: (answers) => answers.useHttps },
-    ]);
-
-    if (httpsAnswers.useHttps) {
-      const dnsValid = await validateDnsRecords(cloneAnswers.domain);
-      if (!dnsValid) {
-        const { proceedAnyway } = await inquirer.prompt([{ type: "confirm", name: "proceedAnyway", message: chalk.yellow(`DNS validation failed for ${cloneAnswers.domain}. Certbot will likely fail. Do you want to proceed with cloning (you might need to fix DNS and run Certbot manually later, or use HTTP only)?`), default: false }]);
-        if (!proceedAnyway) {
-          console.log(chalk.yellow("Instance cloning aborted by user due to DNS issues."));
-          return;
-        }
-        console.log(chalk.yellow("Proceeding with cloning despite DNS validation issues. HTTPS/Certbot might fail."));
-      }
-      if (cliConfig.defaultCertbotEmail && httpsAnswers.useDefaultEmail) {
-        emailToUseForCertbot = cliConfig.defaultCertbotEmail;
-      } else {
-        emailToUseForCertbot = httpsAnswers.emailForCertbot;
-      }
-      if (!emailToUseForCertbot) {
-        console.error(chalk.red("Certbot email is required for HTTPS setup. Aborting."));
-        return;
-      }
-    }
-
-    let adminPayload = {};
-    const { createAdminCli } = await inquirer.prompt([{ type: "confirm", name: "createAdminCli", message: `Data has been cloned. Do you want to create an *additional* superuser (admin) account for "${newName}" via CLI now? (Existing admins from "${sourceName}" are already cloned)`, default: false }]);
-    if (createAdminCli) {
-      const adminCredentials = await inquirer.prompt([
-        { type: "input", name: "adminEmail", message: "Enter new admin email:", validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email.") },
-        { type: "password", name: "adminPassword", message: "Enter new admin password (min 8 chars):", mask: "*", validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters.") },
-      ]);
-      adminPayload = { createAdminCli: true, adminEmail: adminCredentials.adminEmail, adminPassword: adminCredentials.adminPassword };
-    }
-
-    const clonePayload = {
-      sourceName,
-      newName,
-      domain: cloneAnswers.domain,
-      port: cloneAnswers.port,
-      useHttps: httpsAnswers.useHttps,
-      emailForCertbot: httpsAnswers.useHttps ? emailToUseForCertbot : null,
-      useHttp2: cloneAnswers.useHttp2,
-      clientMaxBodySize: clientMaxBodySize,
-      autoRunCertbot: httpsAnswers.useHttps ? httpsAnswers.autoRunCertbot : false,
-      pocketBaseVersion: cliConfig.defaultPocketBaseVersion,
-      ...adminPayload,
-    };
-
-    const result = await _internalCloneInstance(clonePayload);
-
-    for (const msg of result.messages) {
-      console.log(chalk.blue(msg));
-    }
-
-    if (!result.success) {
-      console.error(chalk.red(`Failed to clone instance: ${result.error || "Unknown error during clone operation."}`));
-      return;
-    }
-
-    console.log(chalk.bold.green(`\nInstance "${newName}" cloned!`));
-    const protocol = result.instance.useHttps && result.certbotSuccess ? "https" : "http";
-    const publicBaseUrl = `${protocol}://${result.instance.domain}`;
-    const localAdminUrl = `http://127.0.0.1:${result.instance.port}/_/`;
-    console.log(chalk.blue("\nNew Cloned Instance Details:"));
-    console.log(chalk.blue(`  Public URL: ${publicBaseUrl}/_/`));
-    console.log(chalk.yellow("Remember that all data, including users and admins, has been cloned from the source instance."));
-    if (!createAdminCli) {
-      console.log(chalk.yellow(`You can access the admin panel for "${newName}" using existing credentials from "${sourceName}" or create/reset admins via the UI or 'pb-manager reset-admin ${newName}'.`));
-    }
-    console.log(chalk.yellow(`   - Public Admin: ${publicBaseUrl}/_/`));
-    console.log(chalk.yellow(`   - Local Admin (direct access): ${localAdminUrl}`));
-    if (result.instance.useHttps && !result.certbotSuccess && httpsAnswers.autoRunCertbot) {
-      console.log(chalk.red(`\nCertbot failed for "${newName}". The instance might only be available via HTTP.`));
-      console.log(chalk.red(`Try: sudo certbot --nginx -d ${cloneAnswers.domain} -m ${emailToUseForCertbot}`));
-    }
-  });
-
-program
   .command("update-pocketbase")
   .description("Updates the PocketBase executable using 'pocketbase update' and restarts all instances.")
   .action(async () => {
@@ -2131,7 +1747,14 @@ program
       console.error(chalk.red("PocketBase executable not found. Run 'setup' or 'configure' to set a version and download."));
       return;
     }
-    const { confirmUpdate } = await inquirer.prompt([{ type: "confirm", name: "confirmUpdate", message: `This will run '${POCKETBASE_EXEC_PATH} update' to fetch the latest PocketBase binary and then restart ALL managed instances. Do you want to proceed?`, default: true }]);
+    const { confirmUpdate } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmUpdate",
+        message: `This will run '${POCKETBASE_EXEC_PATH} update' to fetch the latest PocketBase binary and then restart ALL managed instances. Do you want to proceed?`,
+        default: true,
+      },
+    ]);
     if (!confirmUpdate) {
       console.log(chalk.yellow("PocketBase update cancelled by user."));
       return;
@@ -2159,21 +1782,47 @@ program
       console.error(chalk.red(`Instance "${name}" not found.`));
       return;
     }
-    const { confirm } = await inquirer.prompt([{ type: "confirm", name: "confirm", message: `Are you sure you want to remove instance "${name}"? This will stop it, remove its PM2 entry, and Nginx config. Data directory will NOT be deleted automatically by this step.`, default: false }]);
+    const { confirm } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirm",
+        message: `Are you sure you want to remove instance "${name}"? This will stop it, remove its PM2 entry, and Nginx config. Data directory will NOT be deleted automatically by this step.`,
+        default: false,
+      },
+    ]);
     if (!confirm) {
       console.log(chalk.yellow("Removal cancelled."));
       return;
     }
-    const { confirmTyped } = await inquirer.prompt([{ type: "input", name: "confirmTyped", message: `To confirm removal of instance "${name}", please type its name again:` }]);
+    const { confirmTyped } = await inquirer.prompt([
+      {
+        type: "input",
+        name: "confirmTyped",
+        message: `To confirm removal of instance "${name}", please type its name again:`,
+      },
+    ]);
     if (confirmTyped !== name) {
       console.log(chalk.yellow("Instance name did not match. Removal cancelled."));
       return;
     }
 
     let deleteData = false;
-    const { confirmDeleteData } = await inquirer.prompt([{ type: "confirm", name: "confirmDeleteData", message: `Do you want to permanently delete the data directory ${config.instances[name].dataDir} for the removed instance "${name}"? ${chalk.bold.red("THIS CANNOT BE UNDONE.")}`, default: false }]);
+    const { confirmDeleteData } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmDeleteData",
+        message: `Do you want to permanently delete the data directory ${config.instances[name].dataDir} for the removed instance "${name}"? ${chalk.bold.red("THIS CANNOT BE UNDONE.")}`,
+        default: false,
+      },
+    ]);
     if (confirmDeleteData) {
-      const { confirmTypedDeleteData } = await inquirer.prompt([{ type: "input", name: "confirmTypedDeleteData", message: `To confirm PERMANENT DELETION of data for "${name}", type the instance name again:` }]);
+      const { confirmTypedDeleteData } = await inquirer.prompt([
+        {
+          type: "input",
+          name: "confirmTypedDeleteData",
+          message: `To confirm PERMANENT DELETION of data for "${name}", type the instance name again:`,
+        },
+      ]);
       if (confirmTypedDeleteData === name) {
         deleteData = true;
       } else {
@@ -2294,20 +1943,6 @@ program
   });
 
 program
-  .command("audit")
-  .description("Show the audit log of commands executed by this CLI")
-  .action(async () => {
-    const auditLogPath = path.join(CONFIG_DIR, AUDIT_LOG_FILE);
-    if (await fs.pathExists(auditLogPath)) {
-      const auditLog = await fs.readFile(auditLogPath, "utf-8");
-      console.log(chalk.blue("Displaying audit log for this CLI:"));
-      console.log(auditLog);
-    } else {
-      console.log(chalk.yellow("No audit log found. The log will be created as you use commands."));
-    }
-  });
-
-program
   .command("update-ecosystem")
   .description("Regenerate the PM2 ecosystem file and reload PM2")
   .action(async () => {
@@ -2331,25 +1966,60 @@ program
     }
     const instance = config.instances[name];
     const dataDir = instance.dataDir;
-    const { confirm } = await inquirer.prompt([{ type: "confirm", name: "confirm", message: `Are you sure you want to reset instance "${name}"? This will ${chalk.red.bold("DELETE ALL DATA")} in ${dataDir} and start from zero. This action cannot be undone.`, default: false }]);
+    const { confirm } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirm",
+        message: `Are you sure you want to reset instance "${name}"? This will ${chalk.red.bold("DELETE ALL DATA")} in ${dataDir} and start from zero. This action cannot be undone.`,
+        default: false,
+      },
+    ]);
     if (!confirm) {
       console.log(chalk.yellow("Reset cancelled."));
       return;
     }
-    const { confirmTyped } = await inquirer.prompt([{ type: "input", name: "confirmTyped", message: `To confirm PERMANENT DELETION of all data for instance "${name}", please type its name again:` }]);
+    const { confirmTyped } = await inquirer.prompt([
+      {
+        type: "input",
+        name: "confirmTyped",
+        message: `To confirm PERMANENT DELETION of all data for instance "${name}", please type its name again:`,
+      },
+    ]);
     if (confirmTyped !== name) {
       console.log(chalk.yellow("Instance name did not match. Reset cancelled."));
       return;
     }
 
     let adminPayload = { createAdmin: false };
-    const { createAdminCli } = await inquirer.prompt([{ type: "confirm", name: "createAdminCli", message: "Do you want to create a new superuser (admin) account for this reset instance via CLI now?", default: true }]);
+    const { createAdminCli } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "createAdminCli",
+        message: "Do you want to create a new superuser (admin) account for this reset instance via CLI now?",
+        default: true,
+      },
+    ]);
     if (createAdminCli) {
       const adminCredentials = await inquirer.prompt([
-        { type: "input", name: "adminEmail", message: "Enter admin email:", validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email.") },
-        { type: "password", name: "adminPassword", message: "Enter admin password (min 8 chars):", mask: "*", validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters.") },
+        {
+          type: "input",
+          name: "adminEmail",
+          message: "Enter admin email:",
+          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+        },
+        {
+          type: "password",
+          name: "adminPassword",
+          message: "Enter admin password (min 8 chars):",
+          mask: "*",
+          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+        },
       ]);
-      adminPayload = { createAdmin: true, adminEmail: adminCredentials.adminEmail, adminPassword: adminCredentials.adminPassword };
+      adminPayload = {
+        createAdmin: true,
+        adminEmail: adminCredentials.adminEmail,
+        adminPassword: adminCredentials.adminPassword,
+      };
     }
 
     const resetPayload = { name, ...adminPayload };
@@ -2377,11 +2047,26 @@ program
     }
 
     const adminCredentials = await inquirer.prompt([
-      { type: "input", name: "adminEmail", message: "Enter admin email to reset:", validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email.") },
-      { type: "password", name: "adminPassword", message: "Enter new admin password (min 8 chars):", mask: "*", validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters.") },
+      {
+        type: "input",
+        name: "adminEmail",
+        message: "Enter admin email to reset:",
+        validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+      },
+      {
+        type: "password",
+        name: "adminPassword",
+        message: "Enter new admin password (min 8 chars):",
+        mask: "*",
+        validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+      },
     ]);
 
-    const resetPayload = { name, adminEmail: adminCredentials.adminEmail, adminPassword: adminCredentials.adminPassword };
+    const resetPayload = {
+      name,
+      adminEmail: adminCredentials.adminEmail,
+      adminPassword: adminCredentials.adminPassword,
+    };
     const result = await _internalResetAdminPassword(resetPayload);
 
     for (const msg of result.messages) {
@@ -2419,13 +2104,23 @@ program
     if (targetInstanceName !== "all") certbotArgs.push("--cert-name", domainForPrompt);
     if (options.force) certbotArgs.push("--force-renewal");
 
-    const { confirmRenew } = await inquirer.prompt([{ type: "confirm", name: "confirmRenew", message: `This will run Certbot to renew certificates. Command: sudo certbot ${certbotArgs.join(" ")}. Proceed?`, default: true }]);
+    const { confirmRenew } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmRenew",
+        message: `This will run Certbot to renew certificates. Command: sudo certbot ${certbotArgs.join(" ")}. Proceed?`,
+        default: true,
+      },
+    ]);
     if (!confirmRenew) {
       console.log(chalk.yellow("Certificate renewal cancelled by user."));
       return;
     }
 
-    const renewPayload = { instanceName: targetInstanceName === "all" ? null : targetInstanceName, force: options.force || false };
+    const renewPayload = {
+      instanceName: targetInstanceName === "all" ? null : targetInstanceName,
+      force: options.force || false,
+    };
     const result = await _internalRenewCertificates(renewPayload);
 
     for (const msg of result.messages) {
@@ -2447,7 +2142,14 @@ program
       installPath = DEFAULT_INSTALL_PATH_PB_MANAGER;
     }
     console.log(chalk.cyan(`Attempting to update pb-manager from ${SCRIPT_URL}`));
-    const { confirmUpdateSelf } = await inquirer.prompt([{ type: "confirm", name: "confirmUpdateSelf", message: `This will download the latest version of pb-manager from GitHub and overwrite the current script at ${installPath}. Are you sure you want to proceed?`, default: true }]);
+    const { confirmUpdateSelf } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmUpdateSelf",
+        message: `This will download the latest version of pb-manager from GitHub and overwrite the current script at ${installPath}. Are you sure you want to proceed?`,
+        default: true,
+      },
+    ]);
     if (!confirmUpdateSelf) {
       console.log(chalk.yellow("pb-manager update cancelled by user."));
       return;
@@ -2480,12 +2182,21 @@ program
       process.exit(1);
     }
 
-    const { reinstall } = await inquirer.prompt([{ type: "confirm", name: "reinstall", message: "Do you want to reinstall Node.js dependencies (npm install) in the install directory? This is recommended if the update included dependency changes.", default: true }]);
+    const { reinstall } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "reinstall",
+        message: "Do you want to reinstall Node.js dependencies (npm install) in the install directory? This is recommended if the update included dependency changes.",
+        default: true,
+      },
+    ]);
     if (reinstall) {
       try {
         const installDir = path.dirname(installPath);
         if (completeLogging) console.log(chalk.cyan("Running npm install..."));
-        await safeRunCommand("npm", ["install"], "Failed to install dependencies", false, { cwd: installDir });
+        await safeRunCommand("npm", ["install"], "Failed to install dependencies", false, {
+          cwd: installDir,
+        });
         if (completeLogging) console.log(chalk.green("Dependencies installed."));
       } catch (e) {
         console.error(chalk.red("Failed to install dependencies:"), e.message);
@@ -2494,25 +2205,6 @@ program
     console.log(chalk.bold.green("pb-manager has been updated. Please re-run your command if needed."));
     process.exit(0);
   });
-
-program.hook("preAction", async (thisCommand, actionCommand) => {
-  currentCommandNameForAudit = actionCommand.name();
-  currentCommandArgsForAudit = process.argv.slice(3).join(" ");
-  try {
-    await fs.ensureDir(CONFIG_DIR);
-    const cliConfig = await getCliConfig();
-    completeLogging = cliConfig.completeLogging || false;
-    const cachedLatestVersion = await getCachedLatestVersion();
-    if (cliConfig.defaultPocketBaseVersion && cachedLatestVersion && cliConfig.defaultPocketBaseVersion !== cachedLatestVersion && actionCommand.name() !== "update-pocketbase" && actionCommand.name() !== "setup" && actionCommand.name() !== "configure") {
-      console.log(chalk.yellow(`A new version of PocketBase (v${cachedLatestVersion}) has been released. Your default is v${cliConfig.defaultPocketBaseVersion}. Consider running 'pb-manager update-pocketbase' or 'pb-manager configure' to update the default.`));
-    }
-    await appendAuditLog(currentCommandNameForAudit, currentCommandArgsForAudit);
-  } catch (e) {
-    if (completeLogging) {
-      console.log(chalk.red(`Error in preAction hook: ${e.message}`));
-    }
-  }
-});
 
 program.helpInformation = () => `
   PocketBase Manager (pb-manager)
@@ -2524,9 +2216,7 @@ program.helpInformation = () => `
     sudo pb-manager <command> [options]
 
   Main Commands:
-    dashboard                          Show interactive dashboard for all PocketBase instances
     add | create                       Register a new PocketBase instance
-    clone <sourceName> <newName>       Clone an existing instance's data and config to a new one
     list [--json]                      List all managed PocketBase instances
     remove <name>                      Remove a PocketBase instance (prompts for data deletion)
     reset <name>                       Reset a PocketBase instance (delete all data, re-confirm needed)
@@ -2540,16 +2230,15 @@ program.helpInformation = () => `
 
   Setup & Configuration:
     setup [--version]                  Initial setup: creates directories and downloads PocketBase
-    configure                          Set or view CLI configurations (default Certbot email, PB version, logging)
+    configure                          Set or view CLI configurations (default Certbot email, logging)
 
   Updates & Maintenance:
-    renew-certificates <name | all>   Renew SSL certificates using Certbot (use --force to force renewal)
+    renew-certificates <name | all>    Renew SSL certificates using Certbot (use --force to force renewal)
     update-pocketbase                  Update the PocketBase executable and restart all instances
     update-ecosystem                   Regenerate the PM2 ecosystem file and reload PM2
     update-pb-manager                  Update the pb-manager CLI from GitHub
 
   Other:
-    audit                              Show the history of commands executed by this CLI (includes errors)
     help [command]                     Show help for a specific command
 
   Run all commands as root or with sudo.
@@ -2564,6 +2253,17 @@ async function main() {
   await detectDistro();
   const cliConfig = await getCliConfig();
   completeLogging = cliConfig.completeLogging || false;
+
+  if (process.argv[2] && !["setup", "configure", "update-pb-manager"].includes(process.argv[2])) {
+    const installedVersion = await getInstalledPocketBaseVersion();
+    if (installedVersion) {
+      const latestVersion = await getCachedLatestVersion();
+      if (latestVersion && installedVersion !== latestVersion) {
+        console.log(chalk.yellow(`A new version of PocketBase (v${latestVersion}) is available. You are currently on v${installedVersion}.`));
+        console.log(chalk.yellow("Consider running 'pb-manager update-pocketbase' to update."));
+      }
+    }
+  }
 
   if (process.argv[2] !== "setup" && process.argv[2] !== "configure" && process.argv[2] !== "update-pb-manager") {
     if (!shell.which("pm2")) {
@@ -2589,8 +2289,9 @@ async function main() {
 
 main().catch(async (err) => {
   console.error(chalk.red("An unexpected error occurred:"), err.message);
-  await appendAuditLog(currentCommandNameForAudit, currentCommandArgsForAudit, err);
-  const cliConfig = await getCliConfig().catch(() => ({ completeLogging: false }));
+  const cliConfig = await getCliConfig().catch(() => ({
+    completeLogging: false,
+  }));
   if (err.stack && (cliConfig.completeLogging || process.env.DEBUG)) {
     console.error(err.stack);
   }
