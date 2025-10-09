@@ -36,7 +36,7 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.6.0";
+const pbManagerVersion = "0.6.1";
 
 async function safeRunCommand(command, args, errorMessage, ignoreError = false, options = {}) {
   return new Promise((resolve, reject) => {
@@ -954,7 +954,7 @@ async function _internalListInstances() {
 }
 
 async function _internalAddInstance(payload) {
-  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, pocketBaseVersion } = payload;
+  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, pocketBaseVersion, attemptGlobalClientMaxBodySize } = payload;
   const results = { success: false, messages: [], instance: null, nginxConfigPath: null, certbotSuccess: null, error: null };
 
   try {
