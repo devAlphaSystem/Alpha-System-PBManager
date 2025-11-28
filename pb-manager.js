@@ -36,7 +36,7 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.6.1";
+const pbManagerVersion = "0.7.0";
 
 async function safeRunCommand(command, args, errorMessage, ignoreError = false, options = {}) {
   return new Promise((resolve, reject) => {
@@ -56,10 +56,14 @@ async function safeRunCommand(command, args, errorMessage, ignoreError = false, 
     let stderr = "";
 
     if (proc.stdout) {
-      proc.stdout.on("data", (data) => (stdout += data.toString()));
+      proc.stdout.on("data", (data) => {
+        stdout += data.toString();
+      });
     }
     if (proc.stderr) {
-      proc.stderr.on("data", (data) => (stderr += data.toString()));
+      proc.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
     }
 
     proc.on("close", (code) => {
@@ -148,8 +152,8 @@ const POCKETBASE_DOWNLOAD_LOCK_PATH = path.join(POCKETBASE_BIN_DIR, POCKETBASE_D
 
 let completeLogging = false;
 let _latestPocketBaseVersionCache = null;
-let currentCommandNameForAudit = "pb-manager";
-let currentCommandArgsForAudit = "";
+const currentCommandNameForAudit = "pb-manager";
+const currentCommandArgsForAudit = "";
 
 async function validateDnsRecords(domain) {
   try {
@@ -616,7 +620,7 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
   }
 }
 
-async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize = false) {
+async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize = false, allowedIps = [], adminOnlyRestriction = false) {
   const securityHeaders = `
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options "nosniff" always;
@@ -624,6 +628,41 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
     add_header X-XSS-Protection "1; mode=block" always;
   `;
   const clientMaxBody = clientMaxBodySize ? `client_max_body_size ${clientMaxBodySize};` : "";
+
+  let ipRestrictionDirectives = "";
+  if (allowedIps && allowedIps.length > 0) {
+    const allowDirectives = allowedIps.map((ip) => `allow ${ip};`).join("\n          ");
+    ipRestrictionDirectives = `
+          ${allowDirectives}
+          deny all;`;
+  }
+
+  let adminLocationBlock = "";
+  if (adminOnlyRestriction && allowedIps && allowedIps.length > 0) {
+    const adminAllowDirectives = allowedIps.map((ip) => `allow ${ip};`).join("\n          ");
+    adminLocationBlock = `
+        location /_/ {
+          ${clientMaxBody}
+          ${adminAllowDirectives}
+          deny all;
+
+          proxy_pass http://127.0.0.1:${port};
+          proxy_http_version 1.1;
+
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection 'upgrade';
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Real-IP $remote_addr;
+
+          proxy_cache_bypass $http_upgrade;
+        }
+`;
+  }
+
+  const mainLocationIpRestriction = adminOnlyRestriction ? "" : ipRestrictionDirectives;
+
   const http2Suffix = useHttp2 ? " http2" : "";
   let configContent;
 
@@ -643,9 +682,10 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
         ${clientMaxBody}
         
         ${securityHeaders}
-
+${adminLocationBlock}
         location / {
           ${clientMaxBody}
+          ${mainLocationIpRestriction}
 
           proxy_pass http://127.0.0.1:${port};
           proxy_http_version 1.1;
@@ -678,9 +718,10 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
         ${clientMaxBody}
 
         ${securityHeaders}
-
+${adminLocationBlock}
         location / {
           ${clientMaxBody}
+          ${mainLocationIpRestriction}
 
           proxy_pass http://127.0.0.1:${port};
           proxy_http_version 1.1;
@@ -882,7 +923,6 @@ function getCertExpiryDays(domain) {
     const tls = require("node:tls");
     const operationTimeout = 5000;
     let socket;
-    let timeoutId;
 
     const cleanupAndResolve = (value) => {
       clearTimeout(timeoutId);
@@ -893,7 +933,7 @@ function getCertExpiryDays(domain) {
       resolve(value);
     };
 
-    timeoutId = setTimeout(() => {
+    const timeoutId = setTimeout(() => {
       cleanupAndResolve("-");
     }, operationTimeout);
 
@@ -954,7 +994,7 @@ async function _internalListInstances() {
 }
 
 async function _internalAddInstance(payload) {
-  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, pocketBaseVersion, attemptGlobalClientMaxBodySize } = payload;
+  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, pocketBaseVersion, attemptGlobalClientMaxBodySize, allowedIps = [], adminOnlyRestriction = false } = payload;
   const results = { success: false, messages: [], instance: null, nginxConfigPath: null, certbotSuccess: null, error: null };
 
   try {
@@ -992,14 +1032,14 @@ async function _internalAddInstance(payload) {
 
     const instanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, name);
     await fs.ensureDir(instanceDataDir);
-    const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize };
+    const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize, allowedIps, adminOnlyRestriction };
     config.instances[name] = newInstanceConfig;
     await saveInstancesConfig(config);
     if (completeLogging) results.messages.push(`Instance "${name}" configuration saved.`);
     results.instance = newInstanceConfig;
     let certbotRanSuccessfully = false;
 
-    const nginxResult = await generateNginxConfig(name, domain, port, false, false, clientMaxBodySize, attemptGlobalClientMaxBodySize);
+    const nginxResult = await generateNginxConfig(name, domain, port, false, false, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction);
     results.nginxConfigPath = nginxResult.path;
     if (completeLogging) results.messages.push(nginxResult.message);
     else if (!nginxResult.success) results.messages.push(nginxResult.message);
@@ -1021,14 +1061,14 @@ async function _internalAddInstance(payload) {
         results.messages.push(`Certbot for ${domain}: ${certbotResult.message}`);
         certbotRanSuccessfully = certbotResult.success;
         if (certbotResult.success) {
-          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize);
+          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction);
           if (completeLogging) results.messages.push(httpsNginxResult.message);
           else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         } else {
           results.messages.push("Certbot failed. Nginx remains HTTP-only. You may need to run Certbot manually.");
         }
       } else {
-        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize);
+        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction);
         if (completeLogging) results.messages.push(httpsNginxResult.message);
         else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
@@ -1587,6 +1627,89 @@ program
       attemptGlobalClientMaxBodySize = confirmAddToHttpBlock;
     }
 
+    let allowedIps = [];
+    let adminOnlyRestriction = false;
+
+    const { configureIpRestriction } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "configureIpRestriction",
+        message: "Do you want to set custom allowed IP addresses in the Nginx server?",
+        default: false,
+      },
+    ]);
+
+    if (configureIpRestriction) {
+      console.log(chalk.yellow(`\nNote: Local services on this server can always access PocketBase directly via 127.0.0.1:${initialAnswers.port} (bypassing Nginx).`));
+      console.log(chalk.yellow("The IP restrictions below only apply to requests coming through Nginx.\n"));
+
+      const { restrictionScope } = await inquirer.prompt([
+        {
+          type: "list",
+          name: "restrictionScope",
+          message: "What do you want to restrict?",
+          choices: [
+            { name: "Admin UI only (/_/) - API endpoints remain open for all", value: "admin" },
+            { name: "Entire instance - Both admin UI and API endpoints", value: "all" },
+          ],
+          default: "admin",
+        },
+      ]);
+
+      adminOnlyRestriction = restrictionScope === "admin";
+
+      const { includeLocalhost } = await inquirer.prompt([
+        {
+          type: "confirm",
+          name: "includeLocalhost",
+          message: "Automatically allow localhost (127.0.0.1) through Nginx? (Recommended if local services need to use the domain/HTTPS)",
+          default: true,
+        },
+      ]);
+
+      const { ipAddresses } = await inquirer.prompt([
+        {
+          type: "input",
+          name: "ipAddresses",
+          message: "Enter additional allowed IP addresses (comma-separated, e.g., 192.168.1.1, 10.0.0.0/24, 203.0.113.50):",
+          validate: (input) => {
+            if (!input.trim() && !includeLocalhost) {
+              return "Please enter at least one IP address or CIDR range.";
+            }
+            if (!input.trim()) {
+              return true;
+            }
+            const ips = input
+              .split(",")
+              .map((ip) => ip.trim())
+              .filter((ip) => ip);
+            const ipRegex = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
+            const invalidIps = ips.filter((ip) => !ipRegex.test(ip));
+            if (invalidIps.length > 0) {
+              return `Invalid IP address(es): ${invalidIps.join(", ")}. Use format: 192.168.1.1 or 10.0.0.0/24`;
+            }
+            return true;
+          },
+        },
+      ]);
+
+      const userIps = ipAddresses.trim()
+        ? ipAddresses
+            .split(",")
+            .map((ip) => ip.trim())
+            .filter((ip) => ip)
+        : [];
+
+      if (includeLocalhost) {
+        allowedIps = ["127.0.0.1", ...userIps];
+      } else {
+        allowedIps = userIps;
+      }
+
+      const scopeText = adminOnlyRestriction ? "admin UI only" : "entire instance";
+      console.log(chalk.blue(`IP restriction (${scopeText}) will be configured for: ${allowedIps.join(", ")}`));
+    }
+
     let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
     const httpsAnswers = await inquirer.prompt([
       {
@@ -1657,6 +1780,8 @@ program
       clientMaxBodySize: clientMaxBodySize,
       autoRunCertbot: httpsAnswers.useHttps ? httpsAnswers.autoRunCertbot : false,
       attemptGlobalClientMaxBodySize,
+      allowedIps,
+      adminOnlyRestriction,
     };
 
     const result = await _internalAddInstance(addPayload);
@@ -2079,6 +2204,171 @@ program
   });
 
 program
+  .command("update-ip-restrictions <name>")
+  .description("Update IP restrictions for an existing PocketBase instance")
+  .action(async (name) => {
+    const config = await getInstancesConfig();
+    if (!config.instances[name]) {
+      console.error(chalk.red(`Instance "${name}" not found.`));
+      return;
+    }
+
+    const instance = config.instances[name];
+    const currentIps = instance.allowedIps || [];
+    const currentAdminOnly = instance.adminOnlyRestriction || false;
+
+    console.log(chalk.cyan(`\nUpdating IP restrictions for instance "${name}"`));
+    console.log(chalk.blue(`Domain: ${instance.domain}`));
+    console.log(chalk.blue(`Current allowed IPs: ${currentIps.length > 0 ? currentIps.join(", ") : "None (open access)"}`));
+    console.log(chalk.blue(`Current restriction scope: ${currentAdminOnly ? "Admin UI only (/_/)" : "Entire instance"}`));
+    console.log(chalk.yellow(`\nNote: Local services can always access PocketBase directly via 127.0.0.1:${instance.port} (bypassing Nginx).`));
+
+    const { action } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "action",
+        message: "What would you like to do?",
+        choices: [
+          { name: "Set new IP restrictions", value: "set" },
+          { name: "Add IPs to existing list", value: "add" },
+          { name: "Remove all IP restrictions (open access)", value: "remove" },
+          { name: "Cancel", value: "cancel" },
+        ],
+      },
+    ]);
+
+    if (action === "cancel") {
+      console.log(chalk.yellow("Operation cancelled."));
+      return;
+    }
+
+    let newAllowedIps = [];
+    let newAdminOnlyRestriction = currentAdminOnly;
+
+    if (action === "remove") {
+      const { confirmRemove } = await inquirer.prompt([
+        {
+          type: "confirm",
+          name: "confirmRemove",
+          message: "Are you sure you want to remove all IP restrictions? The instance will be accessible from any IP.",
+          default: false,
+        },
+      ]);
+      if (!confirmRemove) {
+        console.log(chalk.yellow("Operation cancelled."));
+        return;
+      }
+      newAllowedIps = [];
+      newAdminOnlyRestriction = false;
+    } else {
+      const { restrictionScope } = await inquirer.prompt([
+        {
+          type: "list",
+          name: "restrictionScope",
+          message: "What do you want to restrict?",
+          choices: [
+            { name: "Admin UI only (/_/) - API endpoints remain open for all", value: "admin" },
+            { name: "Entire instance - Both admin UI and API endpoints", value: "all" },
+          ],
+          default: currentAdminOnly ? "admin" : "all",
+        },
+      ]);
+
+      newAdminOnlyRestriction = restrictionScope === "admin";
+
+      const { includeLocalhost } = await inquirer.prompt([
+        {
+          type: "confirm",
+          name: "includeLocalhost",
+          message: "Include localhost (127.0.0.1) in allowed IPs? (Recommended if local services need to use the domain/HTTPS)",
+          default: currentIps.includes("127.0.0.1") || action === "set",
+        },
+      ]);
+
+      const existingNonLocalhost = currentIps.filter((ip) => ip !== "127.0.0.1");
+      const defaultIps = action === "add" ? "" : existingNonLocalhost.join(", ");
+
+      const { ipAddresses } = await inquirer.prompt([
+        {
+          type: "input",
+          name: "ipAddresses",
+          message: action === "add" ? "Enter IP addresses to add (comma-separated, e.g., 192.168.1.1, 10.0.0.0/24):" : "Enter allowed IP addresses (comma-separated, e.g., 192.168.1.1, 10.0.0.0/24):",
+          default: defaultIps,
+          validate: (input) => {
+            if (!input.trim() && !includeLocalhost) {
+              return "Please enter at least one IP address or CIDR range.";
+            }
+            if (!input.trim()) {
+              return true;
+            }
+            const ips = input
+              .split(",")
+              .map((ip) => ip.trim())
+              .filter((ip) => ip);
+            const ipRegex = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
+            const invalidIps = ips.filter((ip) => !ipRegex.test(ip));
+            if (invalidIps.length > 0) {
+              return `Invalid IP address(es): ${invalidIps.join(", ")}. Use format: 192.168.1.1 or 10.0.0.0/24`;
+            }
+            return true;
+          },
+        },
+      ]);
+
+      const userIps = ipAddresses.trim()
+        ? ipAddresses
+            .split(",")
+            .map((ip) => ip.trim())
+            .filter((ip) => ip)
+        : [];
+
+      if (action === "add") {
+        const allIps = new Set([...currentIps, ...userIps]);
+        if (includeLocalhost) allIps.add("127.0.0.1");
+        else allIps.delete("127.0.0.1");
+        newAllowedIps = Array.from(allIps);
+      } else {
+        if (includeLocalhost) {
+          newAllowedIps = ["127.0.0.1", ...userIps];
+        } else {
+          newAllowedIps = userIps;
+        }
+      }
+    }
+
+    instance.allowedIps = newAllowedIps;
+    instance.adminOnlyRestriction = newAdminOnlyRestriction;
+    await saveInstancesConfig(config);
+
+    console.log(chalk.blue("\nRegenerating Nginx configuration..."));
+    try {
+      const nginxResult = await generateNginxConfig(name, instance.domain, instance.port, instance.useHttps, instance.useHttp2, instance.clientMaxBodySize, false, newAllowedIps, newAdminOnlyRestriction);
+
+      if (!nginxResult.success) {
+        console.error(chalk.red(`Failed to generate Nginx config: ${nginxResult.message}`));
+        return;
+      }
+
+      const reloadResult = await reloadNginx();
+      if (!reloadResult.success) {
+        console.error(chalk.red(`Failed to reload Nginx: ${reloadResult.message}`));
+        return;
+      }
+
+      console.log(chalk.bold.green(`\nIP restrictions updated for "${name}"!`));
+      if (newAllowedIps.length > 0) {
+        const scopeText = newAdminOnlyRestriction ? "admin UI only (/_/)" : "entire instance";
+        console.log(chalk.green(`Restriction scope: ${scopeText}`));
+        console.log(chalk.green(`Allowed IPs: ${newAllowedIps.join(", ")}`));
+      } else {
+        console.log(chalk.green("All IP restrictions removed. Instance is now open to all IPs."));
+      }
+    } catch (error) {
+      console.error(chalk.red(`Error updating IP restrictions: ${error.message}`));
+    }
+  });
+
+program
   .command("renew-certificates [instanceName]")
   .description("Renew SSL certificates using Certbot. Renews all due certs, or a specific instance's cert.")
   .option("-f, --force", "Force renewal even if the certificate is not yet due for expiry.")
@@ -2227,6 +2517,7 @@ program.helpInformation = () => `
     stop <name | all>                  Stop a specific PocketBase instance via PM2
     restart <name | all>               Restart a specific PocketBase instance or all instances via PM2
     logs <name>                        Show logs for a specific PocketBase instance from PM2
+    update-ip-restrictions <name>      Update IP restrictions for an existing instance
 
   Setup & Configuration:
     setup [--version]                  Initial setup: creates directories and downloads PocketBase
