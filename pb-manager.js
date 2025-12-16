@@ -9,7 +9,6 @@ const chalk = require("chalk");
 const unzipper = require("unzipper");
 const shell = require("shelljs");
 const os = require("node:os");
-const prettyBytes = require("pretty-bytes");
 const dns = require("node:dns/promises");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
@@ -30,13 +29,36 @@ const PB_MANAGER_UPDATE_SCRIPT_URL_BASE = "https://raw.githubusercontent.com/dev
 const PB_MANAGER_SCRIPT_NAME = "pb-manager.js";
 const DEFAULT_INSTALL_PATH_PB_MANAGER = "/opt/pb-manager/pb-manager.js";
 const POCKETBASE_DOWNLOAD_LOCK_FILENAME = ".download.lock";
+const VERSION_CACHE_TTL = 86400000;
+const HTTP_TIMEOUT = 5000;
+const TLS_TIMEOUT = 4500;
 
 const NGINX_GLOBAL_CONF_PATH = "/etc/nginx/nginx.conf";
 let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.7.0";
+const pbManagerVersion = "0.8.0";
+
+const VERSION_REGEX = /^\d+\.\d+\.\d+$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const NAME_REGEX = /^[a-zA-Z0-9-]+$/;
+const SIZE_REGEX = /^\d+(M|G|m|g)$/;
+const IP_REGEX = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
+const WHITESPACE_REGEX = /^(\s*)/;
+
+let _tls = null;
+function getTls() {
+  if (!_tls) _tls = require("node:tls");
+  return _tls;
+}
+
+const axiosInstance = axios.create({
+  timeout: HTTP_TIMEOUT,
+  headers: { "User-Agent": "pb-manager" },
+  maxRedirects: 5,
+  validateStatus: (status) => status < 400,
+});
 
 async function safeRunCommand(command, args, errorMessage, ignoreError = false, options = {}) {
   return new Promise((resolve, reject) => {
@@ -44,32 +66,32 @@ async function safeRunCommand(command, args, errorMessage, ignoreError = false, 
       console.log(chalk.yellow(`Executing: ${command} ${args.join(" ")}`));
     }
 
+    const isSilent = options.silent;
     const effectiveOptions = {
-      stdio: completeLogging && !options.silent ? "inherit" : "pipe",
+      stdio: completeLogging && !isSilent ? "inherit" : "pipe",
       shell: false,
       ...options,
     };
 
     const proc = spawn(command, args, effectiveOptions);
 
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks = [];
+    const stderrChunks = [];
 
     if (proc.stdout) {
-      proc.stdout.on("data", (data) => {
-        stdout += data.toString();
-      });
+      proc.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
     }
     if (proc.stderr) {
-      proc.stderr.on("data", (data) => {
-        stderr += data.toString();
-      });
+      proc.stderr.on("data", (chunk) => stderrChunks.push(chunk));
     }
 
     proc.on("close", (code) => {
+      const stdout = Buffer.concat(stdoutChunks).toString();
+      const stderr = Buffer.concat(stderrChunks).toString();
+
       if (code !== 0 && !ignoreError) {
         const fullErrorMsg = errorMessage || `Error executing command: ${command} ${args.join(" ")}`;
-        if (completeLogging || !options.silent) {
+        if (completeLogging || !isSilent) {
           console.error(chalk.red(stderr || stdout));
         }
         const error = new Error(`${fullErrorMsg} - Exit Code: ${code} - Stderr: ${stderr.trim()} - Stdout: ${stdout.trim()}`);
@@ -92,55 +114,40 @@ async function safeRunCommand(command, args, errorMessage, ignoreError = false, 
 }
 
 async function detectDistro() {
-  if (shell.which("apt-get")) {
+  const hasApt = shell.which("apt-get");
+  const hasDnf = !hasApt && shell.which("dnf");
+  const hasPacman = !hasApt && !hasDnf && shell.which("pacman");
+
+  if (hasApt) {
     NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
     NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
     NGINX_DISTRO_MODE = "debian";
-    if (!fs.existsSync(NGINX_SITES_AVAILABLE)) {
-      await safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_AVAILABLE], "Failed to create Nginx sites-available directory", true).catch((e) => {
-        if (completeLogging) console.error(e);
-      });
-    }
-    if (!fs.existsSync(NGINX_SITES_ENABLED)) {
-      await safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_ENABLED], "Failed to create Nginx sites-enabled directory", true).catch((e) => {
-        if (completeLogging) console.error(e);
-      });
-    }
+    await Promise.all([fs.existsSync(NGINX_SITES_AVAILABLE) ? Promise.resolve() : safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_AVAILABLE], "Failed to create Nginx sites-available directory", true).catch(() => {}), fs.existsSync(NGINX_SITES_ENABLED) ? Promise.resolve() : safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_ENABLED], "Failed to create Nginx sites-enabled directory", true).catch(() => {})]);
     return "apt";
   }
 
-  if (shell.which("dnf")) {
+  if (hasDnf) {
     NGINX_SITES_AVAILABLE = "/etc/nginx/conf.d";
     NGINX_SITES_ENABLED = "/etc/nginx/conf.d";
     NGINX_DISTRO_MODE = "rhel";
     if (!fs.existsSync(NGINX_SITES_AVAILABLE)) {
-      await safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_AVAILABLE], "Failed to create Nginx conf.d directory", true).catch((e) => {
-        if (completeLogging) console.error(e);
-      });
+      await safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_AVAILABLE], "Failed to create Nginx conf.d directory", true).catch(() => {});
     }
     return "dnf";
   }
 
-  if (shell.which("pacman")) {
+  if (hasPacman) {
     NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
     NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
     NGINX_DISTRO_MODE = "arch";
-    if (!fs.existsSync(NGINX_SITES_AVAILABLE)) {
-      await safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_AVAILABLE], "Failed to create Nginx sites-available directory", true).catch((e) => {
-        if (completeLogging) console.error(e);
-      });
-    }
-    if (!fs.existsSync(NGINX_SITES_ENABLED)) {
-      await safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_ENABLED], "Failed to create Nginx sites-enabled directory", true).catch((e) => {
-        if (completeLogging) console.error(e);
-      });
-    }
+    await Promise.all([fs.existsSync(NGINX_SITES_AVAILABLE) ? Promise.resolve() : safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_AVAILABLE], "Failed to create Nginx sites-available directory", true).catch(() => {}), fs.existsSync(NGINX_SITES_ENABLED) ? Promise.resolve() : safeRunCommand("sudo", ["mkdir", "-p", NGINX_SITES_ENABLED], "Failed to create Nginx sites-enabled directory", true).catch(() => {})]);
     return "pacman";
   }
   return null;
 }
 
-const CONFIG_DIR = path.join(process.env.HOME || os.homedir(), ".pb-manager");
+const HOME_DIR = process.env.HOME || os.homedir();
+const CONFIG_DIR = path.join(HOME_DIR, ".pb-manager");
 const CLI_CONFIG_PATH = path.join(CONFIG_DIR, CLI_CONFIG_FILE);
 const INSTANCES_CONFIG_PATH = path.join(CONFIG_DIR, INSTANCES_CONFIG_FILE);
 const POCKETBASE_BIN_DIR = path.join(CONFIG_DIR, POCKETBASE_BIN_SUBDIR);
@@ -152,50 +159,38 @@ const POCKETBASE_DOWNLOAD_LOCK_PATH = path.join(POCKETBASE_BIN_DIR, POCKETBASE_D
 
 let completeLogging = false;
 let _latestPocketBaseVersionCache = null;
-const currentCommandNameForAudit = "pb-manager";
-const currentCommandArgsForAudit = "";
+
+let _cliConfigCache = null;
+let _instancesConfigCache = null;
+let _instancesConfigMtime = 0;
 
 async function validateDnsRecords(domain) {
   try {
-    const publicIpRes = await axios.get(IPFY_URL, { timeout: 5000 }).catch(() => null);
-    if (!publicIpRes || !publicIpRes.data || !publicIpRes.data.ip) {
+    const [publicIpRes, aRecordsResult, aaaaRecordsResult] = await Promise.allSettled([axiosInstance.get(IPFY_URL), dns.resolve4(domain), dns.resolve6(domain)]);
+
+    if (publicIpRes.status !== "fulfilled" || !publicIpRes.value?.data?.ip) {
       console.log(chalk.yellow("Could not fetch server's public IP. Skipping DNS validation."));
       return true;
     }
-    const serverIp = publicIpRes.data.ip;
+
+    const serverIp = publicIpRes.value.data.ip;
     let domainResolved = false;
     let pointsToServer = false;
 
-    try {
-      const aRecords = await dns.resolve4(domain);
+    if (aRecordsResult.status === "fulfilled") {
+      const aRecords = aRecordsResult.value;
       domainResolved = true;
-      for (const record of aRecords) {
-        if (record === serverIp) {
-          pointsToServer = true;
-          break;
-        }
-      }
-    } catch (e) {
-      if (completeLogging) {
-        console.log(chalk.blue(`No A records found or error resolving A records for ${domain}: ${e.message}`));
-      }
+      pointsToServer = aRecords.includes(serverIp);
+    } else if (completeLogging) {
+      console.log(chalk.blue(`No A records found or error resolving A records for ${domain}: ${aRecordsResult.reason?.message}`));
     }
 
-    if (!pointsToServer) {
-      try {
-        const aaaaRecords = await dns.resolve6(domain);
-        domainResolved = domainResolved || aaaaRecords.length > 0;
-        for (const record of aaaaRecords) {
-          if (record === serverIp) {
-            pointsToServer = true;
-            break;
-          }
-        }
-      } catch (e) {
-        if (completeLogging) {
-          console.log(chalk.blue(`No AAAA records found or error resolving AAAA records for ${domain}: ${e.message}`));
-        }
-      }
+    if (!pointsToServer && aaaaRecordsResult.status === "fulfilled") {
+      const aaaaRecords = aaaaRecordsResult.value;
+      domainResolved = domainResolved || aaaaRecords.length > 0;
+      pointsToServer = aaaaRecords.includes(serverIp);
+    } else if (!pointsToServer && completeLogging && aaaaRecordsResult.status === "rejected") {
+      console.log(chalk.blue(`No AAAA records found or error resolving AAAA records for ${domain}: ${aaaaRecordsResult.reason?.message}`));
     }
 
     if (!domainResolved) {
@@ -216,22 +211,21 @@ async function getCachedLatestVersion() {
   const now = Date.now();
   try {
     if (await fs.pathExists(VERSION_CACHE_PATH)) {
-      try {
-        const cache = await fs.readJson(VERSION_CACHE_PATH);
-        if (cache && typeof cache.timestamp === "number" && typeof cache.latestVersion === "string" && now - cache.timestamp < 24 * 60 * 60 * 1000) {
-          return cache.latestVersion;
-        }
-      } catch (e) {}
+      const cache = await fs.readJson(VERSION_CACHE_PATH).catch(() => null);
+      if (cache?.timestamp && cache?.latestVersion && now - cache.timestamp < VERSION_CACHE_TTL) {
+        return cache.latestVersion;
+      }
     }
     const latestVersion = await getLatestPocketBaseVersion(true);
-    await fs.ensureDir(path.dirname(VERSION_CACHE_PATH));
-    await fs.writeJson(VERSION_CACHE_PATH, { timestamp: now, latestVersion });
+    fs.ensureDir(path.dirname(VERSION_CACHE_PATH))
+      .then(() => fs.writeJson(VERSION_CACHE_PATH, { timestamp: now, latestVersion }))
+      .catch(() => {});
     return latestVersion;
   } catch (e) {
     if (completeLogging) {
       console.log(chalk.yellow(`Error with version cache: ${e.message}. Fetching directly.`));
     }
-    return await getLatestPocketBaseVersion(false);
+    return getLatestPocketBaseVersion(false);
   }
 }
 
@@ -240,10 +234,7 @@ async function getLatestPocketBaseVersion(forceRefresh = false) {
     return _latestPocketBaseVersionCache;
   }
   try {
-    const res = await axios.get(GITHUB_API_POCKETBASE_RELEASES, {
-      headers: { "User-Agent": "pb-manager" },
-      timeout: 5000,
-    });
+    const res = await axiosInstance.get(GITHUB_API_POCKETBASE_RELEASES);
     if (res.data?.tag_name) {
       _latestPocketBaseVersionCache = res.data.tag_name.replace(/^v/, "");
       return _latestPocketBaseVersionCache;
@@ -267,16 +258,15 @@ async function getInstalledPocketBaseVersion() {
   try {
     const { stdout } = await safeRunCommand(POCKETBASE_EXEC_PATH, ["--version"], "Failed to get PocketBase version", false, { silent: true });
     const version = stdout.trim();
-    if (/^\d+\.\d+\.\d+$/.test(version)) {
-      return version;
-    }
-    return null;
-  } catch (e) {
+    return VERSION_REGEX.test(version) ? version : null;
+  } catch {
     return null;
   }
 }
 
 async function getCliConfig() {
+  if (_cliConfigCache) return _cliConfigCache;
+
   const defaults = {
     defaultCertbotEmail: null,
     completeLogging: false,
@@ -285,65 +275,77 @@ async function getCliConfig() {
   if (await fs.pathExists(CLI_CONFIG_PATH)) {
     try {
       const config = await fs.readJson(CLI_CONFIG_PATH);
-      const mergedConfig = { ...defaults, ...config };
-      return mergedConfig;
+      _cliConfigCache = { ...defaults, ...config };
+      return _cliConfigCache;
     } catch (e) {
       if (completeLogging) {
         console.warn(chalk.yellow("Could not read CLI config, using defaults."));
       }
     }
   }
-  return defaults;
+  _cliConfigCache = defaults;
+  return _cliConfigCache;
 }
 
 async function saveCliConfig(config) {
+  _cliConfigCache = config;
   await fs.ensureDir(CONFIG_DIR);
   await fs.writeJson(CLI_CONFIG_PATH, config, { spaces: 2, mode: 0o600 });
 }
 
 async function ensureBaseSetup() {
-  await fs.ensureDir(CONFIG_DIR);
-  try {
-    await fs.chmod(CONFIG_DIR, 0o700);
-  } catch (e) {
-    if (completeLogging) {
-      console.warn(chalk.yellow(`Could not set permissions for ${CONFIG_DIR}. Please check manually.`));
-    }
-  }
-  await fs.ensureDir(POCKETBASE_BIN_DIR);
-  await fs.ensureDir(INSTANCES_DATA_BASE_DIR);
-  if (!(await fs.pathExists(INSTANCES_CONFIG_PATH))) {
-    await fs.writeJson(INSTANCES_CONFIG_PATH, { instances: {} }, { mode: 0o600 });
-  }
-  if (!(await fs.pathExists(PM2_ECOSYSTEM_FILE))) {
-    await fs.writeFile(PM2_ECOSYSTEM_FILE, "module.exports = { apps: [] };");
-  }
+  await Promise.all([fs.ensureDir(CONFIG_DIR).then(() => fs.chmod(CONFIG_DIR, 0o700).catch(() => {})), fs.ensureDir(POCKETBASE_BIN_DIR), fs.ensureDir(INSTANCES_DATA_BASE_DIR)]);
+
+  await Promise.all([fs.pathExists(INSTANCES_CONFIG_PATH).then((exists) => (exists ? null : fs.writeJson(INSTANCES_CONFIG_PATH, { instances: {} }, { mode: 0o600 }))), fs.pathExists(PM2_ECOSYSTEM_FILE).then((exists) => (exists ? null : fs.writeFile(PM2_ECOSYSTEM_FILE, "module.exports = { apps: [] };")))]);
+
   const currentCliConfig = await getCliConfig();
   await saveCliConfig(currentCliConfig);
 }
 
 async function getInstancesConfig() {
-  if (!(await fs.pathExists(INSTANCES_CONFIG_PATH))) {
-    await fs.writeJson(INSTANCES_CONFIG_PATH, { instances: {} }, { mode: 0o600 });
+  try {
+    const stat = await fs.stat(INSTANCES_CONFIG_PATH).catch(() => null);
+    if (stat && _instancesConfigCache && stat.mtimeMs === _instancesConfigMtime) {
+      return _instancesConfigCache;
+    }
+
+    if (!(await fs.pathExists(INSTANCES_CONFIG_PATH))) {
+      const defaultConfig = { instances: {} };
+      await fs.writeJson(INSTANCES_CONFIG_PATH, defaultConfig, { mode: 0o600 });
+      _instancesConfigCache = defaultConfig;
+      _instancesConfigMtime = Date.now();
+      return _instancesConfigCache;
+    }
+
+    _instancesConfigCache = await fs.readJson(INSTANCES_CONFIG_PATH);
+    _instancesConfigMtime = stat?.mtimeMs || Date.now();
+    return _instancesConfigCache;
+  } catch {
+    const defaultConfig = { instances: {} };
+    _instancesConfigCache = defaultConfig;
+    return defaultConfig;
   }
-  return fs.readJson(INSTANCES_CONFIG_PATH);
 }
 
 async function saveInstancesConfig(config) {
+  _instancesConfigCache = config;
   await fs.writeJson(INSTANCES_CONFIG_PATH, config, { spaces: 2, mode: 0o600 });
+  const stat = await fs.stat(INSTANCES_CONFIG_PATH).catch(() => null);
+  _instancesConfigMtime = stat?.mtimeMs || Date.now();
 }
 
 async function downloadPocketBaseIfNotExists(versionOverride = null, interactive = true) {
   const versionToDownload = versionOverride || (await getLatestPocketBaseVersion());
+  const execExists = await fs.pathExists(POCKETBASE_EXEC_PATH);
 
-  if (!versionOverride && (await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+  if (!versionOverride && execExists) {
     if (completeLogging && interactive) {
       console.log(chalk.green(`PocketBase executable already exists at ${POCKETBASE_EXEC_PATH}. Skipping download.`));
     }
     return { success: true, message: "PocketBase executable already exists." };
   }
 
-  if (await fs.pathExists(POCKETBASE_EXEC_PATH)) {
+  if (execExists) {
     if (interactive) {
       const { confirmOverwrite } = await inquirer.prompt([
         {
@@ -366,9 +368,7 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
 
   try {
     await fs.ensureDir(POCKETBASE_BIN_DIR);
-    await fs.writeFile(POCKETBASE_DOWNLOAD_LOCK_PATH, String(process.pid), {
-      flag: "wx",
-    });
+    await fs.writeFile(POCKETBASE_DOWNLOAD_LOCK_PATH, String(process.pid), { flag: "wx" });
   } catch (e) {
     if (e.code === "EEXIST") {
       if (interactive) {
@@ -376,15 +376,9 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
       }
       await new Promise((resolve) => setTimeout(resolve, 3000));
       if (await fs.pathExists(POCKETBASE_EXEC_PATH)) {
-        return {
-          success: true,
-          message: "PocketBase executable now exists (likely downloaded by another process).",
-        };
+        return { success: true, message: "PocketBase executable now exists (likely downloaded by another process)." };
       }
-      return {
-        success: false,
-        message: "Download lock held by another process.",
-      };
+      return { success: false, message: "Download lock held by another process." };
     }
     throw e;
   }
@@ -395,15 +389,12 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
   }
 
   try {
-    const response = await axios({
-      url: downloadUrl,
-      method: "GET",
-      responseType: "stream",
-    });
+    const response = await axios({ url: downloadUrl, method: "GET", responseType: "stream" });
     const zipPath = path.join(POCKETBASE_BIN_DIR, "pocketbase.zip");
     const writer = fs.createWriteStream(zipPath);
-    response.data.pipe(writer);
+
     await new Promise((resolve, reject) => {
+      response.data.pipe(writer);
       writer.on("finish", resolve);
       writer.on("error", reject);
     });
@@ -411,32 +402,27 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
     if (completeLogging) {
       console.log(chalk.blue("Unzipping PocketBase..."));
     }
+
     await fs
       .createReadStream(zipPath)
       .pipe(unzipper.Extract({ path: POCKETBASE_BIN_DIR }))
       .promise();
-    await fs.remove(zipPath);
-    await fs.chmod(POCKETBASE_EXEC_PATH, "755");
+
+    await Promise.all([fs.remove(zipPath), fs.chmod(POCKETBASE_EXEC_PATH, "755")]);
+
     if (completeLogging && interactive) {
       console.log(chalk.green(`PocketBase v${versionToDownload} downloaded and extracted successfully to ${POCKETBASE_EXEC_PATH}.`));
     }
-    return {
-      success: true,
-      message: `PocketBase v${versionToDownload} downloaded.`,
-    };
+    return { success: true, message: `PocketBase v${versionToDownload} downloaded.` };
   } catch (error) {
     if (interactive) {
       console.error(chalk.red(`Error downloading or extracting PocketBase v${versionToDownload}:`), error.message);
-      if (error.response && error.response.status === 404) {
+      if (error.response?.status === 404) {
         console.error(chalk.red(`Version ${versionToDownload} not found. Please check the version number.`));
       }
     }
     if (!interactive) {
-      return {
-        success: false,
-        message: `Error downloading or extracting PocketBase v${versionToDownload}: ${error.message}`,
-        error,
-      };
+      return { success: false, message: `Error downloading or extracting PocketBase v${versionToDownload}: ${error.message}`, error };
     }
     throw error;
   } finally {
@@ -446,11 +432,14 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
 
 async function updatePm2EcosystemFile() {
   const config = await getInstancesConfig();
-  const apps = [];
-  for (const instName in config.instances) {
-    const inst = config.instances[instName];
+  const instanceNames = Object.keys(config.instances);
+
+  const apps = new Array(instanceNames.length);
+
+  for (let i = 0; i < instanceNames.length; i++) {
+    const inst = config.instances[instanceNames[i]];
     const migrationsDir = path.join(inst.dataDir, "pb_migrations");
-    apps.push({
+    apps[i] = {
       name: `${PM2_INSTANCE_PREFIX}${inst.name}`,
       script: POCKETBASE_EXEC_PATH,
       args: `serve --http "127.0.0.1:${inst.port}" --dir "${inst.dataDir}" --migrationsDir "${migrationsDir}"`,
@@ -459,8 +448,9 @@ async function updatePm2EcosystemFile() {
       watch: false,
       max_memory_restart: "200M",
       env: { NODE_ENV: "production" },
-    });
+    };
   }
+
   const ecosystemContent = `module.exports = { apps: ${JSON.stringify(apps, null, 2)} };`;
   const tempEcosystemFile = `${PM2_ECOSYSTEM_FILE}.${Date.now()}.tmp`;
   await fs.writeFile(tempEcosystemFile, ecosystemContent);
@@ -498,10 +488,7 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
   try {
     if (!(await fs.pathExists(NGINX_GLOBAL_CONF_PATH))) {
       console.log(chalk.yellow(`${NGINX_GLOBAL_CONF_PATH} not found. Skipping modification.`));
-      return {
-        success: false,
-        message: `${NGINX_GLOBAL_CONF_PATH} not found.`,
-      };
+      return { success: false, message: `${NGINX_GLOBAL_CONF_PATH} not found.` };
     }
 
     const backupPath = `${NGINX_GLOBAL_CONF_PATH}.pbmanager_bak_${Date.now()}`;
@@ -512,6 +499,7 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
 
     const { stdout: originalContent } = await safeRunCommand("sudo", ["cat", NGINX_GLOBAL_CONF_PATH]);
     const lines = originalContent.split("\n");
+    const lineCount = lines.length;
 
     let httpBlockStartIndex = -1;
     let inHttpBlock = false;
@@ -520,9 +508,8 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
     let foundWithDifferentValue = false;
     let modified = false;
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const trimmedLine = line.trim();
+    for (let i = 0; i < lineCount; i++) {
+      const trimmedLine = lines[i].trim();
 
       if (!inHttpBlock) {
         if (trimmedLine.startsWith("http") && trimmedLine.endsWith("{")) {
@@ -530,52 +517,47 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
           httpBlockStartIndex = i;
           braceCount = 1;
         }
-      } else {
-        if (trimmedLine.includes("{")) {
-          braceCount++;
-        }
-        if (trimmedLine.includes("}")) {
-          braceCount--;
-        }
+        continue;
+      }
 
-        if (trimmedLine.startsWith("client_max_body_size")) {
-          if (trimmedLine === clientMaxBodySetting) {
-            if (completeLogging) {
-              console.log(chalk.green(`'${clientMaxBodySetting}' is already correctly set in the http block of ${NGINX_GLOBAL_CONF_PATH}.`));
-            }
-            alreadySetCorrectly = true;
-            break;
+      const openBraces = (trimmedLine.match(/{/g) || []).length;
+      const closeBraces = (trimmedLine.match(/}/g) || []).length;
+      braceCount += openBraces - closeBraces;
+
+      if (trimmedLine.startsWith("client_max_body_size")) {
+        if (trimmedLine === clientMaxBodySetting) {
+          if (completeLogging) {
+            console.log(chalk.green(`'${clientMaxBodySetting}' is already correctly set in the http block of ${NGINX_GLOBAL_CONF_PATH}.`));
           }
-          console.log(chalk.yellow(`Found 'client_max_body_size' in the http block of ${NGINX_GLOBAL_CONF_PATH} with a different value: "${trimmedLine}".`));
-          console.log(chalk.yellow("To avoid conflicts, this script will not modify it. Please check your Nginx configuration manually if needed."));
-          foundWithDifferentValue = true;
+          alreadySetCorrectly = true;
           break;
         }
+        console.log(chalk.yellow(`Found 'client_max_body_size' in the http block of ${NGINX_GLOBAL_CONF_PATH} with a different value: "${trimmedLine}".`));
+        console.log(chalk.yellow("To avoid conflicts, this script will not modify it. Please check your Nginx configuration manually if needed."));
+        foundWithDifferentValue = true;
+        break;
+      }
 
-        if (braceCount === 0) {
-          inHttpBlock = false;
-          if (httpBlockStartIndex !== -1 && !alreadySetCorrectly && !foundWithDifferentValue) {
-            const indentation = `${lines[httpBlockStartIndex].match(/^(\s*)/)[0]}  `;
-            lines.splice(httpBlockStartIndex + 1, 0, `${indentation}${clientMaxBodySetting}`);
-            modified = true;
-            if (completeLogging) {
-              console.log(chalk.yellow(`'${clientMaxBodySetting}' was not found in the http block. Adding it.`));
-            }
+      if (braceCount === 0) {
+        inHttpBlock = false;
+        if (httpBlockStartIndex !== -1 && !alreadySetCorrectly && !foundWithDifferentValue) {
+          const indentation = `${lines[httpBlockStartIndex].match(WHITESPACE_REGEX)[0]}  `;
+          lines.splice(httpBlockStartIndex + 1, 0, `${indentation}${clientMaxBodySetting}`);
+          modified = true;
+          if (completeLogging) {
+            console.log(chalk.yellow(`'${clientMaxBodySetting}' was not found in the http block. Adding it.`));
           }
-          httpBlockStartIndex = -1;
         }
+        httpBlockStartIndex = -1;
       }
     }
 
     if (alreadySetCorrectly || foundWithDifferentValue) {
-      return {
-        success: true,
-        message: "Global Nginx config checked. No automatic changes made due to existing settings.",
-      };
+      return { success: true, message: "Global Nginx config checked. No automatic changes made due to existing settings." };
     }
 
     if (!modified && inHttpBlock && httpBlockStartIndex !== -1) {
-      const indentation = `${lines[httpBlockStartIndex].match(/^(\s*)/)[0]}  `;
+      const indentation = `${lines[httpBlockStartIndex].match(WHITESPACE_REGEX)[0]}  `;
       lines.splice(httpBlockStartIndex + 1, 0, `${indentation}${clientMaxBodySetting}`);
       modified = true;
       if (completeLogging) {
@@ -585,10 +567,7 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
 
     if (!modified && httpBlockStartIndex === -1 && !inHttpBlock) {
       console.log(chalk.red(`Could not find the 'http {' block in ${NGINX_GLOBAL_CONF_PATH}. Cannot add '${clientMaxBodySetting}'.`));
-      return {
-        success: false,
-        message: "Http block not found in global Nginx config.",
-      };
+      return { success: false, message: "Http block not found in global Nginx config." };
     }
 
     if (modified) {
@@ -598,55 +577,27 @@ async function addClientMaxBodyToHttpBlockIfMissing(sizeValue) {
       if (completeLogging) {
         console.log(chalk.green(`${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}' in the http block.`));
       }
-      return {
-        success: true,
-        message: `${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}'.`,
-      };
+      return { success: true, message: `${NGINX_GLOBAL_CONF_PATH} updated to include '${clientMaxBodySetting}'.` };
     }
+
     if (completeLogging) {
       console.log(chalk.blue(`No changes made to ${NGINX_GLOBAL_CONF_PATH} regarding '${clientMaxBodySetting}' in the http block.`));
     }
-    return {
-      success: true,
-      message: "No changes needed or made to global Nginx config http block.",
-    };
+    return { success: true, message: "No changes needed or made to global Nginx config http block." };
   } catch (error) {
     console.error(chalk.red(`Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`));
-    return {
-      success: false,
-      message: `Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`,
-      error,
-    };
+    return { success: false, message: `Error modifying ${NGINX_GLOBAL_CONF_PATH}: ${error.message}`, error };
   }
 }
 
-async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize = false, allowedIps = [], adminOnlyRestriction = false) {
-  const securityHeaders = `
+const NGINX_SECURITY_HEADERS = `
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header X-XSS-Protection "1; mode=block" always;
   `;
-  const clientMaxBody = clientMaxBodySize ? `client_max_body_size ${clientMaxBodySize};` : "";
 
-  let ipRestrictionDirectives = "";
-  if (allowedIps && allowedIps.length > 0) {
-    const allowDirectives = allowedIps.map((ip) => `allow ${ip};`).join("\n          ");
-    ipRestrictionDirectives = `
-          ${allowDirectives}
-          deny all;`;
-  }
-
-  let adminLocationBlock = "";
-  if (adminOnlyRestriction && allowedIps && allowedIps.length > 0) {
-    const adminAllowDirectives = allowedIps.map((ip) => `allow ${ip};`).join("\n          ");
-    adminLocationBlock = `
-        location /_/ {
-          ${clientMaxBody}
-          ${adminAllowDirectives}
-          deny all;
-
-          proxy_pass http://127.0.0.1:${port};
+const NGINX_PROXY_HEADERS = `
           proxy_http_version 1.1;
 
           proxy_set_header Upgrade $http_upgrade;
@@ -656,12 +607,35 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
           proxy_set_header X-Real-IP $remote_addr;
 
-          proxy_cache_bypass $http_upgrade;
+          proxy_cache_bypass $http_upgrade;`;
+
+async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize = false, allowedIps = [], adminOnlyRestriction = false) {
+  const clientMaxBody = clientMaxBodySize ? `client_max_body_size ${clientMaxBodySize};` : "";
+  const hasIpRestrictions = allowedIps && allowedIps.length > 0;
+
+  let ipRestrictionDirectives = "";
+  let adminLocationBlock = "";
+
+  if (hasIpRestrictions) {
+    const allowDirectives = allowedIps.map((ip) => `allow ${ip};`).join("\n          ");
+
+    if (adminOnlyRestriction) {
+      adminLocationBlock = `
+        location /_/ {
+          ${clientMaxBody}
+          ${allowDirectives}
+          deny all;
+
+          proxy_pass http://127.0.0.1:${port};
+${NGINX_PROXY_HEADERS}
         }
 `;
+    } else {
+      ipRestrictionDirectives = `
+          ${allowDirectives}
+          deny all;`;
+    }
   }
-
-  const mainLocationIpRestriction = adminOnlyRestriction ? "" : ipRestrictionDirectives;
 
   const http2Suffix = useHttp2 ? " http2" : "";
   let configContent;
@@ -681,23 +655,14 @@ async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp
         server_name ${domain};
         ${clientMaxBody}
         
-        ${securityHeaders}
+        ${NGINX_SECURITY_HEADERS}
 ${adminLocationBlock}
         location / {
           ${clientMaxBody}
-          ${mainLocationIpRestriction}
+          ${ipRestrictionDirectives}
 
           proxy_pass http://127.0.0.1:${port};
-          proxy_http_version 1.1;
-
-          proxy_set_header Upgrade $http_upgrade;
-          proxy_set_header Connection 'upgrade';
-          proxy_set_header Host $host;
-          proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-          proxy_set_header X-Real-IP $remote_addr;
-
-          proxy_cache_bypass $http_upgrade;
+${NGINX_PROXY_HEADERS}
         }
 
         listen 443 ssl${http2Suffix};
@@ -717,23 +682,14 @@ ${adminLocationBlock}
         server_name ${domain};
         ${clientMaxBody}
 
-        ${securityHeaders}
+        ${NGINX_SECURITY_HEADERS}
 ${adminLocationBlock}
         location / {
           ${clientMaxBody}
-          ${mainLocationIpRestriction}
+          ${ipRestrictionDirectives}
 
           proxy_pass http://127.0.0.1:${port};
-          proxy_http_version 1.1;
-
-          proxy_set_header Upgrade $http_upgrade;
-          proxy_set_header Connection 'upgrade';
-          proxy_set_header Host $host;
-          proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-          proxy_set_header X-Real-IP $remote_addr;
-          
-          proxy_cache_bypass $http_upgrade;
+${NGINX_PROXY_HEADERS}
         }
 
         listen 80${http2Suffix};
@@ -742,22 +698,17 @@ ${adminLocationBlock}
     `;
   }
 
-  let nginxConfPath;
-  let nginxEnabledPath;
-
-  if (NGINX_DISTRO_MODE === "rhel") {
-    nginxConfPath = path.join(NGINX_SITES_AVAILABLE, `${instanceName}.conf`);
-    nginxEnabledPath = nginxConfPath;
-  } else {
-    nginxConfPath = path.join(NGINX_SITES_AVAILABLE, instanceName);
-    nginxEnabledPath = path.join(NGINX_SITES_ENABLED, instanceName);
-  }
+  const isRhel = NGINX_DISTRO_MODE === "rhel";
+  const nginxConfPath = isRhel ? path.join(NGINX_SITES_AVAILABLE, `${instanceName}.conf`) : path.join(NGINX_SITES_AVAILABLE, instanceName);
+  const nginxEnabledPath = isRhel ? nginxConfPath : path.join(NGINX_SITES_ENABLED, instanceName);
 
   if (completeLogging) {
     console.log(chalk.blue(`Generating Nginx config for ${instanceName} at ${nginxConfPath}`));
   }
+
   const tempNginxConfPath = `${nginxConfPath}.${Date.now()}.tmp`;
   await fs.writeFile(tempNginxConfPath, configContent.trim());
+
   try {
     await safeRunCommand("sudo", ["mv", tempNginxConfPath, nginxConfPath], `Failed to move Nginx config to ${nginxConfPath}`);
   } catch (error) {
@@ -765,7 +716,7 @@ ${adminLocationBlock}
     throw error;
   }
 
-  if (NGINX_DISTRO_MODE !== "rhel") {
+  if (!isRhel) {
     if (completeLogging) {
       console.log(chalk.blue(`Creating Nginx symlink: ${nginxEnabledPath}`));
     }
@@ -793,11 +744,7 @@ ${adminLocationBlock}
     }
   }
 
-  return {
-    success: true,
-    message: `Nginx config generated for ${instanceName} at ${nginxConfPath}`,
-    path: nginxConfPath,
-  };
+  return { success: true, message: `Nginx config generated for ${instanceName} at ${nginxConfPath}`, path: nginxConfPath };
 }
 
 async function reloadNginx() {
@@ -809,32 +756,26 @@ async function reloadNginx() {
     if (completeLogging) {
       console.log(chalk.blue("Reloading Nginx..."));
     }
-    let reloaded = false;
-    if (shell.which("systemctl")) {
-      try {
-        await safeRunCommand("sudo", ["systemctl", "reload", "nginx"], "Failed to reload Nginx with systemctl");
-        reloaded = true;
-      } catch (e) {}
+
+    const reloadMethods = [
+      { check: () => shell.which("systemctl"), cmd: ["systemctl", "reload", "nginx"] },
+      { check: () => shell.which("service"), cmd: ["service", "nginx", "reload"] },
+      { check: () => true, cmd: ["nginx", "-s", "reload"] },
+    ];
+
+    for (const method of reloadMethods) {
+      if (method.check()) {
+        try {
+          await safeRunCommand("sudo", method.cmd, "Failed to reload Nginx");
+          if (completeLogging) {
+            console.log(chalk.green("Nginx reloaded successfully."));
+          }
+          return { success: true, message: "Nginx reloaded." };
+        } catch {}
+      }
     }
-    if (!reloaded && shell.which("service")) {
-      try {
-        await safeRunCommand("sudo", ["service", "nginx", "reload"], "Failed to reload Nginx with service");
-        reloaded = true;
-      } catch (e) {}
-    }
-    if (!reloaded) {
-      try {
-        await safeRunCommand("sudo", ["nginx", "-s", "reload"], "Failed to reload Nginx with nginx -s reload");
-        reloaded = true;
-      } catch (e) {}
-    }
-    if (!reloaded) {
-      throw new Error("Could not reload Nginx with systemctl, service, or nginx -s reload.");
-    }
-    if (completeLogging) {
-      console.log(chalk.green("Nginx reloaded successfully."));
-    }
-    return { success: true, message: "Nginx reloaded." };
+
+    throw new Error("Could not reload Nginx with systemctl, service, or nginx -s reload.");
   } catch (error) {
     const errorMsg = `Nginx test failed or reload failed: ${error.message}. Please check Nginx configuration.`;
     console.error(chalk.red(errorMsg));
@@ -846,27 +787,27 @@ async function reloadNginx() {
 
 async function ensureDhParamExists() {
   const dhParamPath = "/etc/letsencrypt/ssl-dhparam.pem";
-  if (!(await fs.pathExists(dhParamPath))) {
-    if (completeLogging) {
-      console.log(chalk.yellow(`${dhParamPath} not found. Generating... This may take a few minutes.`));
-    }
-    try {
-      await fs.ensureDir("/etc/letsencrypt");
-      await safeRunCommand("sudo", ["openssl", "dhparam", "-out", dhParamPath, "2048"], `Failed to generate ${dhParamPath}. Nginx might fail to reload.`);
-      if (completeLogging) {
-        console.log(chalk.green(`${dhParamPath} generated successfully.`));
-      }
-      return { success: true, message: `${dhParamPath} generated successfully.` };
-    } catch (error) {
-      const errorMsg = `Error generating ${dhParamPath}: ${error.message}`;
-      console.error(chalk.red(errorMsg));
-      return { success: false, message: errorMsg };
-    }
-  } else {
+  if (await fs.pathExists(dhParamPath)) {
     if (completeLogging) {
       console.log(chalk.green(`${dhParamPath} already exists.`));
     }
     return { success: true, message: `${dhParamPath} already exists.` };
+  }
+
+  if (completeLogging) {
+    console.log(chalk.yellow(`${dhParamPath} not found. Generating... This may take a few minutes.`));
+  }
+  try {
+    await fs.ensureDir("/etc/letsencrypt");
+    await safeRunCommand("sudo", ["openssl", "dhparam", "-out", dhParamPath, "2048"], `Failed to generate ${dhParamPath}. Nginx might fail to reload.`);
+    if (completeLogging) {
+      console.log(chalk.green(`${dhParamPath} generated successfully.`));
+    }
+    return { success: true, message: `${dhParamPath} generated successfully.` };
+  } catch (error) {
+    const errorMsg = `Error generating ${dhParamPath}: ${error.message}`;
+    console.error(chalk.red(errorMsg));
+    return { success: false, message: errorMsg };
   }
 }
 
@@ -920,11 +861,13 @@ async function runCertbot(domain, email, isCliCall = true) {
 
 function getCertExpiryDays(domain) {
   return new Promise((resolve) => {
-    const tls = require("node:tls");
-    const operationTimeout = 5000;
+    const tls = getTls();
     let socket;
+    let resolved = false;
 
-    const cleanupAndResolve = (value) => {
+    const cleanup = (value) => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timeoutId);
       if (socket) {
         socket.removeAllListeners();
@@ -933,97 +876,133 @@ function getCertExpiryDays(domain) {
       resolve(value);
     };
 
-    const timeoutId = setTimeout(() => {
-      cleanupAndResolve("-");
-    }, operationTimeout);
+    const timeoutId = setTimeout(() => cleanup("-"), HTTP_TIMEOUT);
 
     try {
-      socket = tls.connect({ host: domain, port: 443, servername: domain, rejectUnauthorized: false, timeout: operationTimeout - 500 }, () => {
-        const cert = socket.getPeerCertificate();
-        if (!cert || !cert.valid_to) {
-          cleanupAndResolve("-");
-        } else {
+      socket = tls.connect(
+        {
+          host: domain,
+          port: 443,
+          servername: domain,
+          rejectUnauthorized: false,
+          timeout: TLS_TIMEOUT,
+        },
+        () => {
+          const cert = socket.getPeerCertificate();
+          if (!cert?.valid_to) {
+            cleanup("-");
+            return;
+          }
           const expiryDate = new Date(cert.valid_to);
-          const now = new Date();
-          const diff = expiryDate.getTime() - now.getTime();
-          const daysLeft = Math.ceil(diff / (1000 * 60 * 60 * 24));
-          cleanupAndResolve(daysLeft);
-        }
-        socket.end();
-      });
+          const daysLeft = Math.ceil((expiryDate.getTime() - Date.now()) / 86400000);
+          cleanup(daysLeft);
+          socket.end();
+        },
+      );
 
-      socket.on("error", () => cleanupAndResolve("-"));
-      socket.on("timeout", () => cleanupAndResolve("-"));
-    } catch (e) {
-      cleanupAndResolve("-");
+      socket.on("error", () => cleanup("-"));
+      socket.on("timeout", () => cleanup("-"));
+    } catch {
+      cleanup("-");
     }
   });
 }
 
 async function _internalListInstances() {
   const config = await getInstancesConfig();
-  if (Object.keys(config.instances).length === 0) {
+  const instanceNames = Object.keys(config.instances);
+
+  if (instanceNames.length === 0) {
     return [];
   }
+
   const pm2Statuses = {};
   try {
     const pm2ListRaw = shell.exec("pm2 jlist", { silent: true });
     if (pm2ListRaw.code === 0 && pm2ListRaw.stdout) {
       const pm2List = JSON.parse(pm2ListRaw.stdout);
+      const prefixLen = PM2_INSTANCE_PREFIX.length;
       for (const proc of pm2List) {
         if (proc.name.startsWith(PM2_INSTANCE_PREFIX)) {
-          pm2Statuses[proc.name.substring(PM2_INSTANCE_PREFIX.length)] = proc.pm2_env.status;
+          pm2Statuses[proc.name.substring(prefixLen)] = proc.pm2_env.status;
         }
       }
     }
-  } catch (e) {}
+  } catch {}
 
-  const output = [];
-  for (const name in config.instances) {
+  const httpsInstances = [];
+  for (const name of instanceNames) {
     const inst = config.instances[name];
-    let certExpiry = "-";
     if (inst.useHttps) {
-      certExpiry = await getCertExpiryDays(inst.domain);
+      httpsInstances.push({ name, domain: inst.domain });
     }
-    const status = pm2Statuses[name] || "UNKNOWN";
+  }
+
+  const certExpiryMap = {};
+  if (httpsInstances.length > 0) {
+    const expiryPromises = httpsInstances.map(({ name, domain }) => getCertExpiryDays(domain).then((days) => ({ name, days })));
+    const results = await Promise.all(expiryPromises);
+    for (const { name, days } of results) {
+      certExpiryMap[name] = days;
+    }
+  }
+
+  const output = new Array(instanceNames.length);
+  for (let i = 0; i < instanceNames.length; i++) {
+    const name = instanceNames[i];
+    const inst = config.instances[name];
     const protocol = inst.useHttps ? "https" : "http";
     const publicUrl = `${protocol}://${inst.domain}`;
-    output.push({ name, domain: inst.domain, protocol, publicUrl: `${publicUrl}/_/`, internalPort: inst.port, dataDirectory: inst.dataDir, pm2Status: status, adminURL: `http://127.0.0.1:${inst.port}/_/`, certExpiryDays: certExpiry });
+
+    output[i] = {
+      name,
+      domain: inst.domain,
+      protocol,
+      publicUrl: `${publicUrl}/_/`,
+      internalPort: inst.port,
+      dataDirectory: inst.dataDir,
+      pm2Status: pm2Statuses[name] || "UNKNOWN",
+      adminURL: `http://127.0.0.1:${inst.port}/_/`,
+      certExpiryDays: inst.useHttps ? (certExpiryMap[name] ?? "-") : "-",
+    };
   }
+
   return output;
 }
 
 async function _internalAddInstance(payload) {
-  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, pocketBaseVersion, attemptGlobalClientMaxBodySize, allowedIps = [], adminOnlyRestriction = false } = payload;
+  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, attemptGlobalClientMaxBodySize, allowedIps = [], adminOnlyRestriction = false } = payload;
   const results = { success: false, messages: [], instance: null, nginxConfigPath: null, certbotSuccess: null, error: null };
 
   try {
     await ensureBaseSetup();
-    const pbDownloadResult = await downloadPocketBaseIfNotExists(null, false);
-    if (pbDownloadResult && pbDownloadResult.success === false && !(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
+    const [pbDownloadResult, config] = await Promise.all([downloadPocketBaseIfNotExists(null, false), getInstancesConfig()]);
+
+    if (pbDownloadResult?.success === false && !(await fs.pathExists(POCKETBASE_EXEC_PATH))) {
       results.messages.push(`PocketBase executable not found and download failed: ${pbDownloadResult.message}`);
       results.error = "PocketBase download failed";
       return results;
     }
 
-    const config = await getInstancesConfig();
     if (config.instances[name]) {
       results.messages.push(`Instance "${name}" already exists.`);
       results.error = "Instance already exists";
       return results;
     }
-    for (const instName in config.instances) {
-      if (config.instances[instName].port === port) {
-        results.messages.push(`Port ${port} is already in use by instance "${instName}".`);
+
+    for (const inst of Object.values(config.instances)) {
+      if (inst.port === port) {
+        results.messages.push(`Port ${port} is already in use by instance "${inst.name}".`);
         results.error = "Port in use";
         return results;
       }
-      if (config.instances[instName].domain === domain) {
-        results.messages.push(`Domain ${domain} is already in use by instance "${instName}".`);
+      if (inst.domain === domain) {
+        results.messages.push(`Domain ${domain} is already in use by instance "${inst.name}".`);
         results.error = "Domain in use";
         return results;
       }
     }
+
     if (useHttps && !emailForCertbot) {
       results.messages.push("Email for Certbot is required when HTTPS is enabled.");
       results.error = "Missing Certbot email";
@@ -1032,9 +1011,11 @@ async function _internalAddInstance(payload) {
 
     const instanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, name);
     await fs.ensureDir(instanceDataDir);
+
     const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize, allowedIps, adminOnlyRestriction };
     config.instances[name] = newInstanceConfig;
     await saveInstancesConfig(config);
+
     if (completeLogging) results.messages.push(`Instance "${name}" configuration saved.`);
     results.instance = newInstanceConfig;
     let certbotRanSuccessfully = false;
@@ -1073,8 +1054,8 @@ async function _internalAddInstance(payload) {
         else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
       }
-    } else {
-      if (completeLogging) results.messages.push("HTTP-only Nginx config generated (or updated).");
+    } else if (completeLogging) {
+      results.messages.push("HTTP-only Nginx config generated (or updated).");
     }
 
     const nginxReload2 = await reloadNginx();
@@ -1370,16 +1351,23 @@ async function _internalUpdatePocketBaseExecutable() {
 
     if (completeLogging) results.messages.push("Restarting all PocketBase instances via PM2...");
     const instancesConf = await getInstancesConfig();
-    let allRestarted = true;
-    for (const instName in instancesConf.instances) {
-      try {
-        await safeRunCommand("pm2", ["restart", `${PM2_INSTANCE_PREFIX}${instName}`], `Failed to restart instance ${PM2_INSTANCE_PREFIX}${instName}`);
-        if (completeLogging) results.messages.push(`Instance ${PM2_INSTANCE_PREFIX}${instName} restarted.`);
-      } catch (e) {
-        results.messages.push(`Failed to restart instance ${PM2_INSTANCE_PREFIX}${instName}: ${e.message}`);
-        allRestarted = false;
-      }
-    }
+    const instanceNames = Object.keys(instancesConf.instances);
+
+    const restartPromises = instanceNames.map((instName) =>
+      safeRunCommand("pm2", ["restart", `${PM2_INSTANCE_PREFIX}${instName}`], `Failed to restart instance ${PM2_INSTANCE_PREFIX}${instName}`)
+        .then(() => {
+          if (completeLogging) results.messages.push(`Instance ${PM2_INSTANCE_PREFIX}${instName} restarted.`);
+          return true;
+        })
+        .catch((e) => {
+          results.messages.push(`Failed to restart instance ${PM2_INSTANCE_PREFIX}${instName}: ${e.message}`);
+          return false;
+        }),
+    );
+
+    const restartResults = await Promise.all(restartPromises);
+    const allRestarted = restartResults.every(Boolean);
+
     if (allRestarted) {
       results.messages.push("All instances processed for restarting.");
     } else {
@@ -1424,14 +1412,14 @@ async function _internalUpdateEcosystemAndReloadPm2() {
 
 async function _internalSetDefaultCertbotEmail(payload) {
   const { email } = payload;
-  if (email !== null && typeof email !== "string" && email !== "") {
+  if (email !== null && typeof email !== "string") {
     return {
       success: false,
       error: "Invalid payload: 'email' must be a valid email string, empty string, or null.",
       messages: ["Invalid payload for setting Certbot email."],
     };
   }
-  if (typeof email === "string" && email !== "" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  if (email && !EMAIL_REGEX.test(email)) {
     return {
       success: false,
       error: "Invalid payload: 'email' must be a valid email format.",
@@ -1454,6 +1442,23 @@ async function _internalSetDefaultCertbotEmail(payload) {
     };
   }
 }
+
+const validateInstanceName = (input) => NAME_REGEX.test(input) || "Invalid name format.";
+const validateEmail = (input) => EMAIL_REGEX.test(input) || "Please enter a valid email.";
+const validatePort = (input) => (Number.isInteger(input) && input > 1024 && input < 65535) || "Invalid port.";
+const validateSize = (input) => SIZE_REGEX.test(input) || "Please enter a value like 100M or 1G.";
+const validateIpList = (input, includeLocalhost) => {
+  if (!input.trim() && !includeLocalhost) {
+    return "Please enter at least one IP address or CIDR range.";
+  }
+  if (!input.trim()) return true;
+  const ips = input
+    .split(",")
+    .map((ip) => ip.trim())
+    .filter(Boolean);
+  const invalidIps = ips.filter((ip) => !IP_REGEX.test(ip));
+  return invalidIps.length === 0 || `Invalid IP address(es): ${invalidIps.join(", ")}. Use format: 192.168.1.1 or 10.0.0.0/24`;
+};
 
 program
   .command("configure")
@@ -1550,20 +1555,20 @@ program
         type: "input",
         name: "name",
         message: "Instance name (e.g., my-app, no spaces):",
-        validate: (input) => (/^[a-zA-Z0-9-]+$/.test(input) ? true : "Invalid name format."),
+        validate: validateInstanceName,
       },
       {
         type: "input",
         name: "domain",
         message: "Domain/subdomain for this instance (e.g., app.example.com):",
-        validate: (input) => (input.length > 0 ? true : "Domain cannot be empty."),
+        validate: (input) => input.length > 0 || "Domain cannot be empty.",
       },
       {
         type: "number",
         name: "port",
         message: "Internal port for this instance (e.g., 8091):",
         default: 8090 + Math.floor(Math.random() * 100),
-        validate: (input) => (Number.isInteger(input) && input > 1024 && input < 65535 ? true : "Invalid port."),
+        validate: validatePort,
       },
       {
         type: "confirm",
@@ -1589,7 +1594,7 @@ program
         name: "customClientMaxBodySize",
         message: "Enter custom max body size (e.g., 1G, 250M):",
         when: (answers) => answers.clientMaxBodySizeOption === "custom",
-        validate: (input) => (/^\d+(M|G|m|g)$/.test(input) ? true : "Please enter a value like 100M or 1G."),
+        validate: validateSize,
       },
     ]);
 
@@ -1672,24 +1677,7 @@ program
           type: "input",
           name: "ipAddresses",
           message: "Enter additional allowed IP addresses (comma-separated, e.g., 192.168.1.1, 10.0.0.0/24, 203.0.113.50):",
-          validate: (input) => {
-            if (!input.trim() && !includeLocalhost) {
-              return "Please enter at least one IP address or CIDR range.";
-            }
-            if (!input.trim()) {
-              return true;
-            }
-            const ips = input
-              .split(",")
-              .map((ip) => ip.trim())
-              .filter((ip) => ip);
-            const ipRegex = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
-            const invalidIps = ips.filter((ip) => !ipRegex.test(ip));
-            if (invalidIps.length > 0) {
-              return `Invalid IP address(es): ${invalidIps.join(", ")}. Use format: 192.168.1.1 or 10.0.0.0/24`;
-            }
-            return true;
-          },
+          validate: (input) => validateIpList(input, includeLocalhost),
         },
       ]);
 
@@ -1697,14 +1685,10 @@ program
         ? ipAddresses
             .split(",")
             .map((ip) => ip.trim())
-            .filter((ip) => ip)
+            .filter(Boolean)
         : [];
 
-      if (includeLocalhost) {
-        allowedIps = ["127.0.0.1", ...userIps];
-      } else {
-        allowedIps = userIps;
-      }
+      allowedIps = includeLocalhost ? ["127.0.0.1", ...userIps] : userIps;
 
       const scopeText = adminOnlyRestriction ? "admin UI only" : "entire instance";
       console.log(chalk.blue(`IP restriction (${scopeText}) will be configured for: ${allowedIps.join(", ")}`));
@@ -1730,7 +1714,7 @@ program
         name: "emailForCertbot",
         message: "Enter email for Let's Encrypt:",
         when: (answers) => answers.useHttps && (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail),
-        validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Valid email required."),
+        validate: (input) => EMAIL_REGEX.test(input) || "Valid email required.",
         default: (answers) => (!cliConfig.defaultCertbotEmail || !answers.useDefaultEmail ? undefined : cliConfig.defaultCertbotEmail),
       },
       {
@@ -1804,20 +1788,21 @@ program
         default: true,
       },
     ]);
+
     if (createAdminCli) {
       const adminCredentials = await inquirer.prompt([
         {
           type: "input",
           name: "adminEmail",
           message: "Enter admin email:",
-          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+          validate: validateEmail,
         },
         {
           type: "password",
           name: "adminPassword",
           message: "Enter admin password (min 8 chars):",
           mask: "*",
-          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+          validate: (input) => input.length >= 8 || "Password must be at least 8 characters.",
         },
       ]);
       const instanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, initialAnswers.name);
@@ -1828,8 +1813,8 @@ program
       }
       try {
         const adminCmdResult = await safeRunCommand(POCKETBASE_EXEC_PATH, adminCreateArgs, "Failed to create superuser (admin) account via CLI.");
-        if (adminCmdResult?.stdout?.includes("Successfully created new superuser")) {
-          if (completeLogging) console.log(adminCmdResult.stdout.trim());
+        if (adminCmdResult?.stdout?.includes("Successfully created new superuser") && completeLogging) {
+          console.log(adminCmdResult.stdout.trim());
         }
         console.log(chalk.green(`Superuser (admin) account for ${adminCredentials.adminEmail} created successfully!`));
         adminCreatedViaCli = true;
@@ -1994,15 +1979,17 @@ program
 
 async function handlePm2Action(action, instanceNameOrAll) {
   const config = await getInstancesConfig();
-  const targets = [];
-  if (instanceNameOrAll && instanceNameOrAll.toLowerCase() === "all") {
-    targets.push(...Object.keys(config.instances));
+  const instanceNames = Object.keys(config.instances);
+  let targets;
+
+  if (instanceNameOrAll?.toLowerCase() === "all") {
+    targets = instanceNames;
   } else if (instanceNameOrAll) {
     if (!config.instances[instanceNameOrAll]) {
       console.error(chalk.red(`Instance "${instanceNameOrAll}" not found.`));
       return;
     }
-    targets.push(instanceNameOrAll);
+    targets = [instanceNameOrAll];
   } else {
     console.log(chalk.yellow(`Please specify an instance name or 'all'. Usage: pb-manager ${action} <name|all>`));
     return;
@@ -2017,8 +2004,8 @@ async function handlePm2Action(action, instanceNameOrAll) {
   if (completeLogging || targets.length === 1) {
     console.log(chalk.blue(`${capitalizedAction}ing ${targets.length > 1 ? "all managed" : ""} instance(s)...`));
   }
-  let allProcessedSuccessfully = true;
 
+  let allProcessedSuccessfully = true;
   for (const targetName of targets) {
     try {
       await safeRunCommand("pm2", [action, `${PM2_INSTANCE_PREFIX}${targetName}`], `Failed to ${action} instance ${PM2_INSTANCE_PREFIX}${targetName}`);
@@ -2130,14 +2117,14 @@ program
           type: "input",
           name: "adminEmail",
           message: "Enter admin email:",
-          validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+          validate: validateEmail,
         },
         {
           type: "password",
           name: "adminPassword",
           message: "Enter admin password (min 8 chars):",
           mask: "*",
-          validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+          validate: (input) => input.length >= 8 || "Password must be at least 8 characters.",
         },
       ]);
       adminPayload = {
@@ -2176,14 +2163,14 @@ program
         type: "input",
         name: "adminEmail",
         message: "Enter admin email to reset:",
-        validate: (input) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) ? true : "Please enter a valid email."),
+        validate: validateEmail,
       },
       {
         type: "password",
         name: "adminPassword",
         message: "Enter new admin password (min 8 chars):",
         mask: "*",
-        validate: (input) => (input.length >= 8 ? true : "Password must be at least 8 characters."),
+        validate: (input) => input.length >= 8 || "Password must be at least 8 characters.",
       },
     ]);
 
@@ -2294,24 +2281,7 @@ program
           name: "ipAddresses",
           message: action === "add" ? "Enter IP addresses to add (comma-separated, e.g., 192.168.1.1, 10.0.0.0/24):" : "Enter allowed IP addresses (comma-separated, e.g., 192.168.1.1, 10.0.0.0/24):",
           default: defaultIps,
-          validate: (input) => {
-            if (!input.trim() && !includeLocalhost) {
-              return "Please enter at least one IP address or CIDR range.";
-            }
-            if (!input.trim()) {
-              return true;
-            }
-            const ips = input
-              .split(",")
-              .map((ip) => ip.trim())
-              .filter((ip) => ip);
-            const ipRegex = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
-            const invalidIps = ips.filter((ip) => !ipRegex.test(ip));
-            if (invalidIps.length > 0) {
-              return `Invalid IP address(es): ${invalidIps.join(", ")}. Use format: 192.168.1.1 or 10.0.0.0/24`;
-            }
-            return true;
-          },
+          validate: (input) => validateIpList(input, includeLocalhost),
         },
       ]);
 
@@ -2319,7 +2289,7 @@ program
         ? ipAddresses
             .split(",")
             .map((ip) => ip.trim())
-            .filter((ip) => ip)
+            .filter(Boolean)
         : [];
 
       if (action === "add") {
@@ -2328,11 +2298,7 @@ program
         else allIps.delete("127.0.0.1");
         newAllowedIps = Array.from(allIps);
       } else {
-        if (includeLocalhost) {
-          newAllowedIps = ["127.0.0.1", ...userIps];
-        } else {
-          newAllowedIps = userIps;
-        }
+        newAllowedIps = includeLocalhost ? ["127.0.0.1", ...userIps] : userIps;
       }
     }
 
@@ -2446,13 +2412,12 @@ program
     }
 
     try {
-      const [scriptResponse, checksumResponse] = await Promise.all([axios.get(SCRIPT_URL, { responseType: "text" }), axios.get(CHECKSUM_URL, { responseType: "text" }).catch(() => null)]);
+      const [scriptResponse, checksumResponse] = await Promise.all([axiosInstance.get(SCRIPT_URL, { responseType: "text" }), axiosInstance.get(CHECKSUM_URL, { responseType: "text" }).catch(() => null)]);
       const newScriptContent = scriptResponse.data;
+
       if (checksumResponse?.data) {
         const expectedChecksum = checksumResponse.data.trim().split(" ")[0];
-        const hash = crypto.createHash("sha256");
-        hash.update(newScriptContent);
-        const downloadedChecksum = hash.digest("hex");
+        const downloadedChecksum = crypto.createHash("sha256").update(newScriptContent).digest("hex");
         if (downloadedChecksum !== expectedChecksum) {
           console.error(chalk.red("Checksum mismatch! Update aborted. The downloaded file may be compromised or outdated."));
           console.log(chalk.yellow(`Expected: ${expectedChecksum}, Got: ${downloadedChecksum}`));
@@ -2484,9 +2449,7 @@ program
       try {
         const installDir = path.dirname(installPath);
         if (completeLogging) console.log(chalk.cyan("Running npm install..."));
-        await safeRunCommand("npm", ["install"], "Failed to install dependencies", false, {
-          cwd: installDir,
-        });
+        await safeRunCommand("npm", ["install"], "Failed to install dependencies", false, { cwd: installDir });
         if (completeLogging) console.log(chalk.green("Dependencies installed."));
       } catch (e) {
         console.error(chalk.red("Failed to install dependencies:"), e.message);
@@ -2541,22 +2504,24 @@ async function main() {
     process.exit(1);
   }
 
-  await detectDistro();
-  const cliConfig = await getCliConfig();
+  const [, cliConfig] = await Promise.all([detectDistro(), getCliConfig()]);
   completeLogging = cliConfig.completeLogging || false;
 
-  if (process.argv[2] && !["setup", "configure", "update-pb-manager"].includes(process.argv[2])) {
-    const installedVersion = await getInstalledPocketBaseVersion();
-    if (installedVersion) {
-      const latestVersion = await getCachedLatestVersion();
-      if (latestVersion && installedVersion !== latestVersion) {
-        console.log(chalk.yellow(`A new version of PocketBase (v${latestVersion}) is available. You are currently on v${installedVersion}.`));
-        console.log(chalk.yellow("Consider running 'pb-manager update-pocketbase' to update."));
-      }
-    }
-  }
+  const command = process.argv[2];
+  const skipVersionCheck = !command || ["setup", "configure", "update-pb-manager"].includes(command);
 
-  if (process.argv[2] !== "setup" && process.argv[2] !== "configure" && process.argv[2] !== "update-pb-manager") {
+  if (!skipVersionCheck) {
+    const versionCheckPromise = (async () => {
+      const installedVersion = await getInstalledPocketBaseVersion();
+      if (installedVersion) {
+        const latestVersion = await getCachedLatestVersion();
+        if (latestVersion && installedVersion !== latestVersion) {
+          console.log(chalk.yellow(`A new version of PocketBase (v${latestVersion}) is available. You are currently on v${installedVersion}.`));
+          console.log(chalk.yellow("Consider running 'pb-manager update-pocketbase' to update."));
+        }
+      }
+    })();
+
     if (!shell.which("pm2")) {
       console.error(chalk.red("PM2 is not installed or not in PATH. PM2 is essential for managing PocketBase instances."));
       console.log(chalk.blue("Please install PM2 globally by running: npm install -g pm2"));
@@ -2567,22 +2532,17 @@ async function main() {
       console.warn(chalk.yellow("Nginx is not found in PATH. Nginx is required for reverse proxying and HTTPS."));
       console.log(chalk.blue("Please install Nginx (e.g., sudo apt install nginx or sudo dnf install nginx)."));
     }
+
+    await versionCheckPromise;
   }
 
   await ensureBaseSetup();
-  const parsedCommand = program.parseAsync(process.argv);
-  const foundCommand = program.commands.find((cmd) => cmd.name() === process.argv[2]);
-  if (foundCommand) {
-    program.runningCommand = foundCommand;
-  }
-  await parsedCommand;
+  await program.parseAsync(process.argv);
 }
 
 main().catch(async (err) => {
   console.error(chalk.red("An unexpected error occurred:"), err.message);
-  const cliConfig = await getCliConfig().catch(() => ({
-    completeLogging: false,
-  }));
+  const cliConfig = await getCliConfig().catch(() => ({ completeLogging: false }));
   if (err.stack && (cliConfig.completeLogging || process.env.DEBUG)) {
     console.error(err.stack);
   }
