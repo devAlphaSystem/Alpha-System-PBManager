@@ -15,7 +15,7 @@ const crypto = require("node:crypto");
 
 const PM2_INSTANCE_PREFIX = "pb-";
 const PM2_STATUS_ONLINE = "online";
-const POCKETBASE_FALLBACK_VERSION = "0.29.3";
+const POCKETBASE_FALLBACK_VERSION = "0.36.0";
 const CLI_CONFIG_FILE = "cli-config.json";
 const INSTANCES_CONFIG_FILE = "instances.json";
 const POCKETBASE_BIN_SUBDIR = "bin";
@@ -38,7 +38,7 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.8.0";
+const pbManagerVersion = "0.9.0";
 
 const VERSION_REGEX = /^\d+\.\d+\.\d+$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -609,7 +609,7 @@ const NGINX_PROXY_HEADERS = `
 
           proxy_cache_bypass $http_upgrade;`;
 
-async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize = false, allowedIps = [], adminOnlyRestriction = false) {
+async function generateNginxConfig(instanceName, domain, port, useHttps, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize = false, allowedIps = [], adminOnlyRestriction = false, optimizeRealtime = false) {
   const clientMaxBody = clientMaxBodySize ? `client_max_body_size ${clientMaxBodySize};` : "";
   const hasIpRestrictions = allowedIps && allowedIps.length > 0;
 
@@ -637,6 +637,31 @@ ${NGINX_PROXY_HEADERS}
     }
   }
 
+  let realtimeLocationBlock = "";
+  if (optimizeRealtime) {
+    realtimeLocationBlock = `
+        location /api/realtime {
+          proxy_pass http://127.0.0.1:${port};
+
+          proxy_http_version 1.1;
+          proxy_set_header Connection '';
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Real-IP $remote_addr;
+
+          # SSE streams are long-lived — prevent nginx from killing idle connections
+          proxy_read_timeout 86400s;
+          proxy_send_timeout 86400s;
+          send_timeout 86400s;
+
+          # Flush SSE events immediately to clients
+          proxy_buffering off;
+          proxy_cache off;
+        }
+`;
+  }
+
   const http2Suffix = useHttp2 ? " http2" : "";
   let configContent;
 
@@ -657,6 +682,7 @@ ${NGINX_PROXY_HEADERS}
         
         ${NGINX_SECURITY_HEADERS}
 ${adminLocationBlock}
+${realtimeLocationBlock}
         location / {
           ${clientMaxBody}
           ${ipRestrictionDirectives}
@@ -684,6 +710,7 @@ ${NGINX_PROXY_HEADERS}
 
         ${NGINX_SECURITY_HEADERS}
 ${adminLocationBlock}
+${realtimeLocationBlock}
         location / {
           ${clientMaxBody}
           ${ipRestrictionDirectives}
@@ -971,7 +998,7 @@ async function _internalListInstances() {
 }
 
 async function _internalAddInstance(payload) {
-  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, attemptGlobalClientMaxBodySize, allowedIps = [], adminOnlyRestriction = false } = payload;
+  const { name, domain, port, useHttps = true, emailForCertbot, useHttp2 = true, clientMaxBodySize, autoRunCertbot = true, attemptGlobalClientMaxBodySize, allowedIps = [], adminOnlyRestriction = false, optimizeRealtime = false } = payload;
   const results = { success: false, messages: [], instance: null, nginxConfigPath: null, certbotSuccess: null, error: null };
 
   try {
@@ -1012,7 +1039,7 @@ async function _internalAddInstance(payload) {
     const instanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, name);
     await fs.ensureDir(instanceDataDir);
 
-    const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize, allowedIps, adminOnlyRestriction };
+    const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize, allowedIps, adminOnlyRestriction, optimizeRealtime };
     config.instances[name] = newInstanceConfig;
     await saveInstancesConfig(config);
 
@@ -1020,7 +1047,7 @@ async function _internalAddInstance(payload) {
     results.instance = newInstanceConfig;
     let certbotRanSuccessfully = false;
 
-    const nginxResult = await generateNginxConfig(name, domain, port, false, false, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction);
+    const nginxResult = await generateNginxConfig(name, domain, port, false, false, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction, optimizeRealtime);
     results.nginxConfigPath = nginxResult.path;
     if (completeLogging) results.messages.push(nginxResult.message);
     else if (!nginxResult.success) results.messages.push(nginxResult.message);
@@ -1042,14 +1069,14 @@ async function _internalAddInstance(payload) {
         results.messages.push(`Certbot for ${domain}: ${certbotResult.message}`);
         certbotRanSuccessfully = certbotResult.success;
         if (certbotResult.success) {
-          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction);
+          const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction, optimizeRealtime);
           if (completeLogging) results.messages.push(httpsNginxResult.message);
           else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         } else {
           results.messages.push("Certbot failed. Nginx remains HTTP-only. You may need to run Certbot manually.");
         }
       } else {
-        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction);
+        const httpsNginxResult = await generateNginxConfig(name, domain, port, true, useHttp2, clientMaxBodySize, attemptGlobalClientMaxBodySize, allowedIps, adminOnlyRestriction, optimizeRealtime);
         if (completeLogging) results.messages.push(httpsNginxResult.message);
         else if (!httpsNginxResult.success) results.messages.push(httpsNginxResult.message);
         results.messages.push("HTTPS Nginx config generated, Certbot not run automatically. Manual run needed for SSL.");
@@ -1694,6 +1721,15 @@ program
       console.log(chalk.blue(`IP restriction (${scopeText}) will be configured for: ${allowedIps.join(", ")}`));
     }
 
+    const { optimizeRealtime } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "optimizeRealtime",
+        message: "Optimize PocketBase's realtime path (/api/realtime) in Nginx? (Recommended if using SSE/realtime features)",
+        default: true,
+      },
+    ]);
+
     let emailToUseForCertbot = cliConfig.defaultCertbotEmail;
     const httpsAnswers = await inquirer.prompt([
       {
@@ -1766,6 +1802,7 @@ program
       attemptGlobalClientMaxBodySize,
       allowedIps,
       adminOnlyRestriction,
+      optimizeRealtime,
     };
 
     const result = await _internalAddInstance(addPayload);
@@ -2308,7 +2345,7 @@ program
 
     console.log(chalk.blue("\nRegenerating Nginx configuration..."));
     try {
-      const nginxResult = await generateNginxConfig(name, instance.domain, instance.port, instance.useHttps, instance.useHttp2, instance.clientMaxBodySize, false, newAllowedIps, newAdminOnlyRestriction);
+      const nginxResult = await generateNginxConfig(name, instance.domain, instance.port, instance.useHttps, instance.useHttp2, instance.clientMaxBodySize, false, newAllowedIps, newAdminOnlyRestriction, instance.optimizeRealtime || false);
 
       if (!nginxResult.success) {
         console.error(chalk.red(`Failed to generate Nginx config: ${nginxResult.message}`));
