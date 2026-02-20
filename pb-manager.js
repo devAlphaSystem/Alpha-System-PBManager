@@ -38,7 +38,7 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.9.0";
+const pbManagerVersion = "0.9.1";
 
 const VERSION_REGEX = /^\d+\.\d+\.\d+$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -439,10 +439,11 @@ async function updatePm2EcosystemFile() {
   for (let i = 0; i < instanceNames.length; i++) {
     const inst = config.instances[instanceNames[i]];
     const migrationsDir = path.join(inst.dataDir, "pb_migrations");
+    const hooksDir = path.join(inst.dataDir, "pb_hooks");
     apps[i] = {
       name: `${PM2_INSTANCE_PREFIX}${inst.name}`,
       script: POCKETBASE_EXEC_PATH,
-      args: `serve --http "127.0.0.1:${inst.port}" --dir "${inst.dataDir}" --migrationsDir "${migrationsDir}"`,
+      args: `serve --http "127.0.0.1:${inst.port}" --dir "${inst.dataDir}" --migrationsDir "${migrationsDir}" --hooksDir "${hooksDir}"`,
       cwd: inst.dataDir,
       autorestart: true,
       watch: false,
@@ -1037,7 +1038,9 @@ async function _internalAddInstance(payload) {
     }
 
     const instanceDataDir = path.join(INSTANCES_DATA_BASE_DIR, name);
-    await fs.ensureDir(instanceDataDir);
+    const instanceHooksDir = path.join(instanceDataDir, "pb_hooks");
+    const instanceMigrationsDir = path.join(instanceDataDir, "pb_migrations");
+    await Promise.all([fs.ensureDir(instanceDataDir), fs.ensureDir(instanceHooksDir), fs.ensureDir(instanceMigrationsDir)]);
 
     const newInstanceConfig = { name, domain, port, dataDir: instanceDataDir, useHttps, emailForCertbot: useHttps ? emailForCertbot : null, useHttp2, clientMaxBodySize, allowedIps, adminOnlyRestriction, optimizeRealtime };
     config.instances[name] = newInstanceConfig;
@@ -1223,7 +1226,9 @@ async function _internalResetInstance(payload) {
         return results;
       }
     }
-    await fs.ensureDir(dataDir);
+    const hooksDir = path.join(dataDir, "pb_hooks");
+    const migrationsDir = path.join(dataDir, "pb_migrations");
+    await Promise.all([fs.ensureDir(dataDir), fs.ensureDir(hooksDir), fs.ensureDir(migrationsDir)]);
     if (completeLogging) results.messages.push(`Data directory ${dataDir} recreated.`);
 
     const pm2UpdateRes = await updatePm2EcosystemFile();
