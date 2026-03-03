@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 
-const { program } = require("commander");
-const inquirer = require("inquirer");
-const fs = require("fs-extra");
-const path = require("node:path");
-const axios = require("axios");
-const chalk = require("chalk");
-const unzipper = require("unzipper");
-const shell = require("shelljs");
-const os = require("node:os");
-const dns = require("node:dns/promises");
-const { spawn } = require("node:child_process");
-const crypto = require("node:crypto");
+import { program } from "commander";
+import inquirer from "inquirer";
+import fs from "fs-extra";
+import path from "node:path";
+import { createSession, get as nlcurlGet, request as nlcurlRequest } from "nlcurl";
+import chalk from "chalk";
+import unzipper from "unzipper";
+import shell from "shelljs";
+import os from "node:os";
+import dns from "node:dns/promises";
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import tls from "node:tls";
 
 const PM2_INSTANCE_PREFIX = "pb-";
 const PM2_STATUS_ONLINE = "online";
@@ -38,7 +39,7 @@ let NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available";
 let NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled";
 let NGINX_DISTRO_MODE = "debian";
 
-const pbManagerVersion = "0.9.1";
+const pbManagerVersion = "0.9.2";
 
 const VERSION_REGEX = /^\d+\.\d+\.\d+$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -47,17 +48,10 @@ const SIZE_REGEX = /^\d+(M|G|m|g)$/;
 const IP_REGEX = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
 const WHITESPACE_REGEX = /^(\s*)/;
 
-let _tls = null;
-function getTls() {
-  if (!_tls) _tls = require("node:tls");
-  return _tls;
-}
-
-const axiosInstance = axios.create({
+const nlcurlSession = createSession({
   timeout: HTTP_TIMEOUT,
   headers: { "User-Agent": "pb-manager" },
   maxRedirects: 5,
-  validateStatus: (status) => status < 400,
 });
 
 async function safeRunCommand(command, args, errorMessage, ignoreError = false, options = {}) {
@@ -166,14 +160,14 @@ let _instancesConfigMtime = 0;
 
 async function validateDnsRecords(domain) {
   try {
-    const [publicIpRes, aRecordsResult, aaaaRecordsResult] = await Promise.allSettled([axiosInstance.get(IPFY_URL), dns.resolve4(domain), dns.resolve6(domain)]);
+    const [publicIpRes, aRecordsResult, aaaaRecordsResult] = await Promise.allSettled([nlcurlSession.get(IPFY_URL), dns.resolve4(domain), dns.resolve6(domain)]);
 
-    if (publicIpRes.status !== "fulfilled" || !publicIpRes.value?.data?.ip) {
+    if (publicIpRes.status !== "fulfilled" || !publicIpRes.value?.json()?.ip) {
       console.log(chalk.yellow("Could not fetch server's public IP. Skipping DNS validation."));
       return true;
     }
 
-    const serverIp = publicIpRes.value.data.ip;
+    const serverIp = publicIpRes.value.json().ip;
     let domainResolved = false;
     let pointsToServer = false;
 
@@ -234,9 +228,9 @@ async function getLatestPocketBaseVersion(forceRefresh = false) {
     return _latestPocketBaseVersionCache;
   }
   try {
-    const res = await axiosInstance.get(GITHUB_API_POCKETBASE_RELEASES);
-    if (res.data?.tag_name) {
-      _latestPocketBaseVersionCache = res.data.tag_name.replace(/^v/, "");
+    const res = await nlcurlSession.get(GITHUB_API_POCKETBASE_RELEASES);
+    if (res.json()?.tag_name) {
+      _latestPocketBaseVersionCache = res.json().tag_name.replace(/^v/, "");
       return _latestPocketBaseVersionCache;
     }
     if (completeLogging) {
@@ -389,12 +383,12 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
   }
 
   try {
-    const response = await axios({ url: downloadUrl, method: "GET", responseType: "stream" });
+    const response = await nlcurlGet(downloadUrl, { stream: true });
     const zipPath = path.join(POCKETBASE_BIN_DIR, "pocketbase.zip");
     const writer = fs.createWriteStream(zipPath);
 
     await new Promise((resolve, reject) => {
-      response.data.pipe(writer);
+      response.body.pipe(writer);
       writer.on("finish", resolve);
       writer.on("error", reject);
     });
@@ -417,7 +411,7 @@ async function downloadPocketBaseIfNotExists(versionOverride = null, interactive
   } catch (error) {
     if (interactive) {
       console.error(chalk.red(`Error downloading or extracting PocketBase v${versionToDownload}:`), error.message);
-      if (error.response?.status === 404) {
+      if (error.statusCode === 404) {
         console.error(chalk.red(`Version ${versionToDownload} not found. Please check the version number.`));
       }
     }
@@ -889,7 +883,6 @@ async function runCertbot(domain, email, isCliCall = true) {
 
 function getCertExpiryDays(domain) {
   return new Promise((resolve) => {
-    const tls = getTls();
     let socket;
     let resolved = false;
 
@@ -2454,11 +2447,31 @@ program
     }
 
     try {
-      const [scriptResponse, checksumResponse] = await Promise.all([axiosInstance.get(SCRIPT_URL, { responseType: "text" }), axiosInstance.get(CHECKSUM_URL, { responseType: "text" }).catch(() => null)]);
-      const newScriptContent = scriptResponse.data;
+      const downloadSession = createSession({
+        timeout: 60000,
+        headers: { "User-Agent": "pb-manager" },
+        maxRedirects: 5,
+        httpVersion: "1.1",
+        retry: { count: 3, delay: 1000, backoff: "exponential", jitter: 200 },
+      });
 
-      if (checksumResponse?.data) {
-        const expectedChecksum = checksumResponse.data.trim().split(" ")[0];
+      let scriptResponse, checksumResponse;
+      try {
+        [scriptResponse, checksumResponse] = await Promise.all([downloadSession.get(SCRIPT_URL), downloadSession.get(CHECKSUM_URL).catch(() => null)]);
+      } finally {
+        downloadSession.close();
+      }
+
+      if (!scriptResponse.ok) {
+        console.error(chalk.red(`Failed to download pb-manager.js: server returned HTTP ${scriptResponse.status} ${scriptResponse.statusText}`));
+        process.exit(1);
+        return;
+      }
+
+      const newScriptContent = scriptResponse.text();
+
+      if (checksumResponse?.ok && checksumResponse.text()) {
+        const expectedChecksum = checksumResponse.text().trim().split(" ")[0];
         const downloadedChecksum = crypto.createHash("sha256").update(newScriptContent).digest("hex");
         if (downloadedChecksum !== expectedChecksum) {
           console.error(chalk.red("Checksum mismatch! Update aborted. The downloaded file may be compromised or outdated."));
@@ -2475,7 +2488,9 @@ program
       await safeRunCommand("sudo", ["mv", tempInstallPath, installPath], `Failed to move updated script to ${installPath}`);
       console.log(chalk.green(`pb-manager.js updated at ${installPath}`));
     } catch (e) {
-      console.error(chalk.red("Failed to download or write pb-manager.js:"), e.message);
+      const detail = e instanceof Error ? `${e.constructor.name}: ${e.message || "(no message)"}` : String(e);
+      console.error(chalk.red(`Failed to download or write pb-manager.js: ${detail}`));
+      if (completeLogging && e instanceof Error && e.stack) console.error(e.stack);
       process.exit(1);
     }
 
