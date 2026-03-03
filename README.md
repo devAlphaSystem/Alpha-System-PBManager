@@ -4,7 +4,7 @@
 
 It supports **Debian-based** (Ubuntu, Debian), **RHEL-based** (Fedora, CentOS, Oracle Linux), and **Arch-based** Linux distributions.
 
-**Version: 0.9.1**
+**Version: 0.9.2**
 
 ## Key Features
 
@@ -39,8 +39,10 @@ The installer handles most dependencies, but ensure you have:
 Run the following command to download and run the installer script. This will set up Node.js, PM2, Nginx, Certbot, and `pb-manager` itself.
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManager/main/install-pb-manager.sh -o /tmp/install-pb-manager.sh && sudo bash /tmp/install-pb-manager.sh && sudo rm /tmp/install-pb-manager.sh
+curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PBManager/main/install-pb-manager.sh | sudo bash
 ```
+
+Once the installer finishes, run `sudo pb-manager setup` to download PocketBase binaries.
 
 ### Manual Installation
 
@@ -55,7 +57,7 @@ sudo curl -fsSL https://raw.githubusercontent.com/devAlphaSystem/Alpha-System-PB
     ```bash
     cd /opt/pb-manager
     sudo npm init -y
-    sudo npm install commander inquirer@8.2.4 fs-extra axios chalk@4.1.2 unzipper shelljs
+    sudo npm install commander inquirer@8 fs-extra nlcurl chalk unzipper shelljs
     ```
 4.  **Create Symlink:**
     ```bash
@@ -96,11 +98,6 @@ sudo pb-manager <command> [options]
     - `instances.json`: Stores details of all managed instances.
     - `cli-config.json`: Global tool settings.
     - `ecosystem.config.js`: PM2 process configuration.
-
-## Documentation
-
-For more in-depth guides and troubleshooting:
-**[Full Documentation](https://docs.alphasystem.dev/view/5hnk7504ca02hpu)**
 
 ## Disclaimer
 

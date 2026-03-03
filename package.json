@@ -1,12 +1,14 @@
 {
   "name": "alpha-system-pbmanager",
-  "version": "0.9.1",
+  "version": "0.9.2",
+  "type": "module",
   "main": "pb-manager.js",
   "scripts": {
     "start": "node pb-manager.js",
     "format": "prettier --write ."
   },
   "devDependencies": {
-    "prettier": "^3.7.4"
-  }
+    "prettier": "^3.8.1"
+  },
+  "updated": "2026.03.03.0707"
 }
